@@ -1,0 +1,9 @@
+[project]
+name = "skysurvey-backend"
+version = "1.0.0"
+description = "NASA SPHEREx Multi-Epoch Visualization & Spectrophotometry Backend"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

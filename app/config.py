@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     allwise_table: str = "allwise_p3as_psd"
     wise_search_radius_deg: float = 0.02
     wise_match_radius_arcsec: float = 10.0
-    wise_timeout_s: float = 15.0
+    wise_timeout_s: float = 6.0
 
     # --- Solar System (IMCCE SkyBoT) ---
     skybot_url: str = "https://vo.imcce.fr/webservices/skybot/skybotconesearch_query.php"

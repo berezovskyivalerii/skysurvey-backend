@@ -72,8 +72,9 @@ class WiseService:
         self.s = settings
         self.http = http
 
-    async def _tap_csv(self, adql: str) -> list[dict[str, str]]:
-        url = f"{self.s.irsa_tap_url.rstrip('/')}/sync"
+    async def _tap_csv(self, adql: str, tap_url: str | None = None) -> list[dict[str, str]]:
+        base_url = (tap_url or self.s.irsa_tap_url).rstrip("/")
+        url = f"{base_url}/sync"
         params = {
             "REQUEST": "doQuery",
             "LANG": "ADQL",
@@ -88,21 +89,21 @@ class WiseService:
         r.raise_for_status()
         text = r.text
         if text.lstrip().startswith("<"):
-            raise RuntimeError(f"IRSA TAP returned XML error: {text[:200]}")
+            raise RuntimeError(f"TAP returned XML error: {text[:200]}")
         return list(csv.DictReader(io.StringIO(text)))
 
     @staticmethod
     def _parse_catwise_rows(raw_rows: list[dict[str, str]]) -> list[dict]:
         sources: list[dict] = []
         for row in raw_rows:
-            sid = (row.get("source_id") or "").strip()
-            ra = _clean(row.get("ra"))
-            dec = _clean(row.get("dec"))
+            sid = (row.get("source_id") or row.get("objID") or "").strip()
+            ra = _clean(row.get("ra") or row.get("RAdeg"))
+            dec = _clean(row.get("dec") or row.get("DEdeg"))
             if not sid or ra is None or dec is None:
                 continue
-            pmra = _clean(row.get("pmra"))
-            pmdec = _clean(row.get("pmdec"))
-            # IRSA catwise_2020 stores proper motion in arcsec/yr; convert to mas/yr
+            pmra = _clean(row.get("pmra") or row.get("pmRA"))
+            pmdec = _clean(row.get("pmdec") or row.get("pmDE"))
+            # IRSA catwise_2020 and VizieR II/365/catwise store proper motion in arcsec/yr; convert to mas/yr
             if pmra is not None and abs(pmra) < 25.0:
                 pmra *= 1000.0
             if pmdec is not None and abs(pmdec) < 25.0:
@@ -114,10 +115,10 @@ class WiseService:
                     "dec": dec,
                     "pmra": pmra,
                     "pmdec": pmdec,
-                    "w1mpro": _clean(row.get("w1mpro")),
-                    "w2mpro": _clean(row.get("w2mpro")),
-                    "w1snr": _clean(row.get("w1snr")),
-                    "w2snr": _clean(row.get("w2snr")),
+                    "w1mpro": _clean(row.get("w1mpro") or row.get("w1mpro_pm") or row.get("W1mproPM")),
+                    "w2mpro": _clean(row.get("w2mpro") or row.get("w2mpro_pm") or row.get("W2mproPM")),
+                    "w1snr": _clean(row.get("w1snr") or row.get("w1snr_pm") or row.get("snr1_pm") or row.get("snrW1pm")),
+                    "w2snr": _clean(row.get("w2snr") or row.get("w2snr_pm") or row.get("snr2_pm") or row.get("snrW2pm")),
                 }
             )
         return sources
@@ -150,7 +151,9 @@ class WiseService:
         t0 = time.perf_counter()
         radius = self.s.wise_search_radius_deg
         catwise_adql = f"""
-            SELECT source_id, ra, dec, pmra, pmdec, w1mpro, w2mpro, w1snr, w2snr
+            SELECT source_id, ra, dec, pmra, pmdec,
+                   w1mpro_pm AS w1mpro, w2mpro_pm AS w2mpro,
+                   w1snr_pm AS w1snr, w2snr_pm AS w2snr
             FROM {self.s.wise_table}
             WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra:.8f}, {dec:.8f}, {radius:.6f})) = 1
         """
@@ -172,8 +175,25 @@ class WiseService:
                 log.info("AllWISE fallback returned %d sources in %.2fs", len(sources), time.perf_counter() - t0)
                 return WiseResult(sources=sources, catalog="AllWISE", epoch_mjd=ALLWISE_EPOCH_MJD)
             except Exception as exc2:
-                log.warning("AllWISE fallback failed: %s", exc2)
-                return WiseResult(sources=[], catalog="CatWISE2020", epoch_mjd=CATWISE_EPOCH_MJD, error=str(exc2))
+                log.warning("AllWISE fallback failed (%s); trying VizieR CatWISE2020 mirror", exc2)
+                vizier_adql = f"""
+                    SELECT objID AS source_id, RAdeg AS ra, DEdeg AS dec,
+                           pmRA AS pmra, pmDE AS pmdec,
+                           W1mproPM AS w1mpro, W2mproPM AS w2mpro,
+                           snrW1pm AS w1snr, snrW2pm AS w2snr
+                    FROM "II/365/catwise"
+                    WHERE CONTAINS(POINT('ICRS', RAdeg, DEdeg), CIRCLE('ICRS', {ra:.8f}, {dec:.8f}, {radius:.6f})) = 1
+                """
+                try:
+                    raw_rows = await self._tap_csv(
+                        vizier_adql, tap_url="https://tapvizier.cds.unistra.fr/TAPVizieR/tap"
+                    )
+                    sources = self._parse_catwise_rows(raw_rows)
+                    log.info("VizieR CatWISE2020 mirror returned %d sources in %.2fs", len(sources), time.perf_counter() - t0)
+                    return WiseResult(sources=sources, catalog="CatWISE2020", epoch_mjd=CATWISE_EPOCH_MJD)
+                except Exception as exc3:
+                    log.warning("VizieR CatWISE2020 fallback also failed: %s", exc3)
+                    return WiseResult(sources=[], catalog="CatWISE2020", epoch_mjd=CATWISE_EPOCH_MJD, error=str(exc2))
 
     def best_match(
         self,
@@ -192,7 +212,9 @@ class WiseService:
             if s.get("ra") is None or s.get("dec") is None:
                 continue
             ra_o, dec_o = propagate_wise(s, mjd, res.epoch_mjd)
-            sep = ang_sep_arcsec(ra_o, dec_o, ref_ra, ref_dec)
+            sep_prop = ang_sep_arcsec(ra_o, dec_o, ref_ra, ref_dec)
+            sep_cat = ang_sep_arcsec(float(s["ra"]), float(s["dec"]), ra, dec)
+            sep = min(sep_prop, sep_cat)
             if sep <= self.s.wise_match_radius_arcsec and (best is None or sep < best[3]):
                 best = (s, ra_o, dec_o, sep)
 
@@ -205,18 +227,21 @@ class WiseService:
         w1_w2_color = round(w1 - w2, 3) if (w1 is not None and w2 is not None) else None
         is_ultracool = bool(w1_w2_color is not None and w1_w2_color >= 1.5)
 
-        pos_ra = spherex_ra if spherex_ra is not None else ra_o
-        pos_dec = spherex_dec if spherex_dec is not None else dec_o
-        dt_yr = max(abs(mjd - res.epoch_mjd) / 365.25, 0.1)
-        baseline_shift_arcsec = ang_sep_arcsec(float(s["ra"]), float(s["dec"]), pos_ra, pos_dec)
-        baseline_pm = round(baseline_shift_arcsec / dt_yr, 3)
-
         pmra = s.get("pmra")
         pmdec = s.get("pmdec")
         if pmra is not None and s.get("pm_unit") == "arcsec/yr":
             pmra = float(pmra) * 1000.0
         if pmdec is not None and s.get("pm_unit") == "arcsec/yr":
             pmdec = float(pmdec) * 1000.0
+
+        pos_ra = spherex_ra if spherex_ra is not None else ra_o
+        pos_dec = spherex_dec if spherex_dec is not None else dec_o
+        dt_yr = max(abs(mjd - res.epoch_mjd) / 365.25, 0.1)
+        baseline_shift_arcsec = ang_sep_arcsec(float(s["ra"]), float(s["dec"]), pos_ra, pos_dec)
+        if baseline_shift_arcsec < 0.05 and pmra is not None and pmdec is not None:
+            baseline_pm = round(math.hypot(float(pmra), float(pmdec)) / 1000.0, 3)
+        else:
+            baseline_pm = round(baseline_shift_arcsec / dt_yr, 3)
 
         return WiseSource(
             source_id=str(s["source_id"]),

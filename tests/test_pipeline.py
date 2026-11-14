@@ -447,6 +447,21 @@ def test_wise_crossmatch_and_propagation():
     assert match.is_ultracool_color is True
     assert match.baseline_pm_arcsec_yr == pytest.approx(8.1, abs=0.1)
 
+    # Also verify matching when queried by catalog J2015 coordinates (e.g. preset WISE 0855 without Gaia match)
+    match_cat = wise.best_match(res, catwise_ra0, target_dec, mjd=61005.125, spherex_ra=catwise_ra0, spherex_dec=target_dec)
+    assert match_cat is not None
+    assert match_cat.separation_arcsec < 0.2
+    assert match_cat.baseline_pm_arcsec_yr == pytest.approx(8.1, abs=0.1)
+
+    # Verify _parse_catwise_rows handles IRSA catwise_2020 (*_pm) and VizieR (W1mproPM) column names
+    parsed_irsa = WiseService._parse_catwise_rows(
+        [{"source_id": "CW_1", "ra": "133.79", "dec": "-7.24", "pmra": "-8.1", "pmdec": "0.7", "w1mpro_pm": "17.9", "w2mpro_pm": "13.8", "w1snr_pm": "3.5", "w2snr_pm": "32.0"}]
+    )
+    assert len(parsed_irsa) == 1
+    assert parsed_irsa[0]["w1mpro"] == pytest.approx(17.9)
+    assert parsed_irsa[0]["w2mpro"] == pytest.approx(13.8)
+    assert parsed_irsa[0]["pmra"] == pytest.approx(-8100.0)
+
     # Test HTTP CSV parsing + automatic fallback from catwise_2020 to allwise_p3as_psd
     calls: list[str] = []
 

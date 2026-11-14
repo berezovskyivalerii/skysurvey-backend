@@ -144,7 +144,22 @@ GET /api/v1/presets
         "rgb": "https://.../epoch_00_2025-05-06_rgb.png?v=1.0.0",
         "variance": "https://.../epoch_00_2025-05-06_variance.png?v=1.0.0",
         "flags": "https://.../epoch_00_2025-05-06_flags.png?v=1.0.0"
-      }
+      },
+      "known_minor_planets": [
+        {
+          "number": "12345",
+          "name": "2018 AB12",
+          "object_type": "MBA",
+          "ra": 133.7912,
+          "dec": -7.2411,
+          "v_mag": 18.4,
+          "dra_arcsec_hr": -24.1,
+          "ddec_arcsec_hr": 5.3,
+          "separation_arcsec": 19.8,
+          "x": 274.2,
+          "y": 241.5
+        }
+      ]
     },
     {
       "index": 1,
@@ -167,6 +182,24 @@ GET /api/v1/presets
     "reason": "5.9-sigma SPHEREx detection with no Gaia DR3 optical counterpart within 10\"",
     "catalog": "Gaia DR3",
     "match": null,
+    "wise_match": {
+      "source_id": "J085510.83-071442.5",
+      "catalog": "CatWISE2020",
+      "ra": 133.795125,
+      "dec": -7.245139,
+      "ra_obs": 133.772891,
+      "dec_obs": -7.243211,
+      "separation_arcsec": 0.65,
+      "w1mpro": 17.82,
+      "w2mpro": 13.89,
+      "w1_w2_color": 3.93,
+      "w1snr": 4.2,
+      "w2snr": 28.5,
+      "pmra_mas_yr": -8051.0,
+      "pmdec_mas_yr": 698.0,
+      "baseline_pm_arcsec_yr": 8.081,
+      "is_ultracool_color": true
+    },
     "spherex_snr": 5.89,
     "high_proper_motion": false,
     "overlay": [
@@ -201,7 +234,9 @@ GET /api/v1/presets
         "y_from": 255.9,
         "shift_arcsec": 4.2,
         "pm_arcsec_yr": 4.24,
-        "delta_flux_ujy": 145.6
+        "delta_flux_ujy": 145.6,
+        "motion_model": "linear_proper_motion",
+        "parallax_arcsec": null
       }
     ]
   },
@@ -220,17 +255,20 @@ GET /api/v1/presets
 - Все картинки уже выровнены по координатам и яркости. При переключении `epochs[activeEpoch].layers.image` (или `layers.rgb`) неподвижные звезды стоят на месте, а движущийся объект прыгает!
 - **Слой `layers.flags`:** это полупрозрачный PNG (`512×512`) с оранжевыми/красными пикселями там, где попали космические лучи или битые пиксели матрицы. Его можно класть **поверх** основной картинки (`position: absolute; top: 0; left: 0; pointer-events: none`) по чекбоксу «Показать артефакты/битые пиксели».
 
-#### Б. Бейдж классификации и наложение известных звезд (`crossmatch`)
+#### Б. Бейдж классификации и наложение известных звезд (`crossmatch`) и астероидов (`known_minor_planets`)
 - Поле `crossmatch.classification` принимает значения:
   - **`"candidate"`** — **ГЛАВНАЯ НАХОДКА!** Объект ярко светится в инфракрасном телескопе SPHEREx, но отсутствует в оптическом каталоге Gaia DR3. Подсветите ярким бейджем **«Кандидат (Коричневый карлик / Планета X)»**.
   - **`"known_star"`** — объект совпал с известной звездой Gaia DR3 (в `crossmatch.match` лежат её ID, расстояние в парсеках `distance_pc`, блеск `phot_g_mean_mag` и скорость движения `pm_total_mas_yr`). Если `crossmatch.high_proper_motion === true`, покажите бейдж **«Быстролетящая звезда (High Proper Motion)»**.
   - **`"no_detection"`** — в центре кадра только фоновый шум.
+- **`crossmatch.wise_match`** (если найден ИК-источник в `CatWISE2020` или `AllWISE`): содержит `w1mpro` (3.35 мкм), `w2mpro` (4.60 мкм), цвет `w1_w2_color` (`W1 - W2`), флаг `is_ultracool_color` (`true` при `W1 - W2 >= 1.5 mag`, типично для ультрахолодных T/Y-карликов), а также `baseline_pm_arcsec_yr` — собственное движение за ~10 лет между эпохой WISE и SPHEREx (и перенесенные координаты `ra_obs`, `dec_obs`). Выведите отдельную карточку **«WISE 10-yr Cross-Check»**.
 - Массив `crossmatch.overlay`: содержит уже готовые пиксельные координаты **`(x, y)` в диапазоне `0..512`**. Нарисуйте в `<svg viewBox="0 0 512 512">` поверх картинки тонкие голубые кружки в точках `(item.x, item.y)` — пользователь сразу увидит, какие источники на снимке уже известны науке, а какие — нет!
+- Массив `epochs[i].known_minor_planets`: список известных малых тел Солнечной системы (астероиды/кометы из IMCCE SkyBoT на момент `mjd_mid` каждой эпохи) с готовыми координатами `(x, y)` в `0..512`, `name`, `object_type`, `v_mag`, `dra_arcsec_hr`, `ddec_arcsec_hr`. Нарисуйте их оранжевыми ромбами или пунктирными кружками поверх кадра текущей эпохи, чтобы не перепутать транзитный астероид с Планетой X!
 
 #### В. Карта движения и авто-поиск аномалий (`difference`)
 - `difference.diff_image_url` — картинка разности между самой первой и самой последней датой (`512×512 PNG`). Неподвижные звезды на ней вычтены в белый/нейтральный фон; синее пятно — откуда объект ушел, красное — куда пришел.
 - `difference.anomalies` — массив автоматически найденных движущихся объектов (`"moving_dipole"`) и вспыхнувших/потускневших переменных звезд (`"variable_brightened"` / `"variable_dimmed"`):
   - Для `"moving_dipole"` нарисуйте поверх картинки стрелочку или рамку от `(x_from, y_from)` к `(x, y)` и подпишите скорость `pm_arcsec_yr` (`"/год`).
+  - Поля траекторной модели (при наличии 3+ эпох): `motion_model` (`"linear_proper_motion"` — линейное движение близкого коричневого карлика / быстрой звезды; `"parallax_dominated"` — преобладает годовой параллакс Земли, характерный для далёкого тела Солнечной системы вроде Планеты X; `"ambiguous"` — недостаточно эпох или неоднозначно) и `parallax_arcsec` (оценка амплитуды параллакса в угловых секундах). Покажите соответствующий бейдж рядом с диполем!
 
 ---
 
@@ -316,7 +354,15 @@ GET /api/v1/target/spectrum?ra=133.7951&dec=-7.2451
     "peak_flux_ujy": 202.793,
     "ir_color_index": 1.95,
     "spectral_hint": "red_stellar_or_dusty_source",
-    "flux_unit": "uJy"
+    "flux_unit": "uJy",
+    "estimated_temp_k": 310.0,
+    "ch4_absorption_depth": 0.42,
+    "h2o_absorption_depth": 0.31,
+    "model_curve": [
+      {"wavelength_um": 0.75, "model_flux": 0.12},
+      {"wavelength_um": 3.30, "model_flux": 48.5},
+      {"wavelength_um": 4.60, "model_flux": 198.4}
+    ]
   },
   "chart_data": [
     {
@@ -350,6 +396,10 @@ GET /api/v1/target/spectrum?ra=133.7951&dec=-7.2451
 - **Вертикальные полосы молекул (`absorption_bands_reference`):** нарисуйте полупрозрачные вертикальные зоны (`<ReferenceArea x1={range_um[0]} x2={range_um[1]} />`) для воды ($\text{H}_2\text{O}$), метана ($\text{CH}_4$) и $\text{CO}$ — провалы графика внутри этих полос наглядно доказывают наличие холодной атмосферы у коричневого карлика!
 - **Карточки метрик над графиком (`spectrum_summary`):**
   - `ir_color_index`: отношение яркости на `3–5 мкм` к `0.75–1.5 мкм` (если `> 2.5` — объект аномально красный/холодный).
+  - `estimated_temp_k`: автоматическая оценка эффективной температуры чёрного тела Планка ($T_{\text{eff}}$ в Кельвинах, диапазон `200..6000` K; может быть `null`, если точек недостаточно).
+  - `ch4_absorption_depth`: глубина полосы поглощения метана $\text{CH}_4$ на `3.2–3.4 мкм` (`0.0..1.0`, где `> 0.25` указывает на холодную атмосферу T/Y-карлика).
+  - `h2o_absorption_depth`: глубина полосы поглощения водяного пара $\text{H}_2\text{O}$ на `2.55–2.85 мкм` (`0.0..1.0`).
+  - `model_curve`: массив точек `{wavelength_um, model_flux}` для отрисовки плавной теоретической кривой (пунктирная линия поверх измеренных точек `chart`).
   - `spectral_hint`: человекочитаемый класс спектра:
     - `"ultra_cool_y_dwarf_or_planet_x_candidate"` — ультрахолодный Y-карлик / кандидат в Планету X (яркий пик на `4–5 мкм`).
     - `"cold_brown_dwarf_candidate"` — холодный коричневый карлик (T/L-класс с метановым поглощением).

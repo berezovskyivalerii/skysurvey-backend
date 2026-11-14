@@ -519,7 +519,7 @@ class PipelineService:
         diff_png = fp.render_difference_png(snr_map, self.s.png_size, self.s.png_resample)
         deep_png = fp.render_image(stack_img, vmin, vmax, "asinh", self.s.png_size, self.s.png_resample)
         anomalies = (
-            fp.detect_diff_anomalies(diff_img, snr_map, grid, c_a.mjd_mid, c_b.mjd_mid)
+            fp.detect_diff_anomalies(diff_img, snr_map, grid, c_a.mjd_mid, c_b.mjd_mid, coadds=coadds)
             if len(coadds) >= 2
             else []
         )
@@ -758,12 +758,38 @@ class PipelineService:
         (img_a, var_a, mjd_a), (img_b, var_b, mjd_b) = await asyncio.gather(
             _load_ep(idx_a), _load_ep(idx_b)
         )
+        all_ep_coadds: list[fp.EpochCoadd] | None = None
+        if len(idx_list) >= 3 and idx_a != idx_b:
+            loaded_map = {idx_a: (img_a, var_a, mjd_a), idx_b: (img_b, var_b, mjd_b)}
+            other_idxs = [i for i in idx_list if i not in loaded_map]
+            other_data = await asyncio.gather(*(_load_ep(i) for i in other_idxs))
+            for i, d in zip(other_idxs, other_data):
+                loaded_map[i] = d
+            all_ep_coadds = [
+                fp.EpochCoadd(
+                    index=i,
+                    image=loaded_map[i][0],
+                    variance=loaded_map[i][1],
+                    flags=loaded_map[i][0].astype("int64") * 0,
+                    coverage=loaded_map[i][0].astype("int16") * 0,
+                    n_frames=1,
+                    detectors=[],
+                    mjd_start=loaded_map[i][2],
+                    mjd_end=loaded_map[i][2],
+                    mjd_mid=loaded_map[i][2],
+                )
+                for i in idx_list
+            ]
 
         def _compute_cpu() -> DifferenceResult:
             grid = fp.make_grid(ra_n, dec_n, fov_n, self.s.spherex_pixel_scale_arcsec, self.s.png_size)
             diff_img, snr_map = fp.compute_difference_map(img_a, var_a, img_b, var_b)
             diff_png = fp.render_difference_png(snr_map, self.s.png_size, self.s.png_resample)
-            anomalies = fp.detect_diff_anomalies(diff_img, snr_map, grid, mjd_a, mjd_b) if idx_a != idx_b else []
+            anomalies = (
+                fp.detect_diff_anomalies(diff_img, snr_map, grid, mjd_a, mjd_b, coadds=all_ep_coadds)
+                if idx_a != idx_b
+                else []
+            )
             dipoles = [a.snr for a in anomalies if a.anomaly_type == "moving_dipole"]
             deep_url = (cached.get("difference") or {}).get("deep_stack_url") if cached else None
             return DifferenceResult(

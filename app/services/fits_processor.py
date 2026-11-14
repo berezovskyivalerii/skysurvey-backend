@@ -544,6 +544,7 @@ def detect_diff_anomalies(
     mjd_b: float,
     snr_threshold: float = 3.8,
     max_anomalies: int = 12,
+    coadds: list[EpochCoadd] | None = None,
 ) -> list[DiffAnomaly]:
     """Automatically detect moving dipoles (proper-motion objects) and variable
     stars (monopole brightenings / dimmings) on the epoch difference map."""
@@ -665,7 +666,20 @@ def detect_diff_anomalies(
         )
 
     anomalies.sort(key=lambda a: a.snr, reverse=True)
-    return anomalies[:max_anomalies]
+    result = anomalies[:max_anomalies]
+
+    if coadds is not None and len(coadds) >= 3:
+        from app.services.astrometry_fitter import fit_motion_model, measure_anomaly_centroids
+
+        for anom in result:
+            if anom.anomaly_type != "moving_dipole":
+                continue
+            centroids = measure_anomaly_centroids(coadds, grid, anom, mjd_a=mjd_a, mjd_b=mjd_b)
+            model, plx = fit_motion_model(centroids)
+            anom.motion_model = model
+            anom.parallax_arcsec = plx
+
+    return result
 
 
 # ================================================================ detection ==

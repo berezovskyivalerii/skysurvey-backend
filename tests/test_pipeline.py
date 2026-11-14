@@ -19,6 +19,7 @@ from app.core.keys import target_key
 from app.core.spherex import CHANNEL_CENTERS_UM, N_CHANNELS, parse_flag_bits
 from app.main import create_app
 from app.services import fits_processor as fp
+from app.services.astrometry_fitter import EpochCentroid, _parallax_factors, fit_motion_model
 from app.services.cache_manager import FitsCache
 from app.services.fits_stream import NotFitsError, read_hdus
 from app.services.gaia_service import GaiaResult, GaiaService, propagate
@@ -570,6 +571,71 @@ def test_fit_spectral_model_brown_dwarf_and_star():
     assert star_fit["estimated_temp_k"] >= 3500.0
     assert (star_fit["ch4_absorption_depth"] or 0.0) < 0.1
     assert (star_fit["h2o_absorption_depth"] or 0.0) < 0.1
+
+
+def test_astrometry_fitter_linear_vs_parallax(tmp_path: Path):
+    """Verify multi-epoch astrometric fitter distinguishes linear proper motion from annual parallax."""
+    ra, dec = 133.7951, -7.2451
+    grid = fp.make_grid(ra, dec, fov=0.06, pixscale_arcsec=6.15, png_size=128)
+    mjds = [60801.0, 60986.0, 61166.0]  # May 2025, Nov 2025, May 2026
+
+    # 1. Ambiguous when < 3 epochs
+    assert fit_motion_model([
+        EpochCentroid(0, mjds[0], ra, dec, 17.0, 17.0, 0.2),
+        EpochCentroid(1, mjds[1], ra + 0.002, dec, 16.0, 17.0, 0.2),
+    ]) == ("ambiguous", None)
+
+    # 2. Linear proper-motion brown dwarf (9"/yr -> +9" in 0.5yr, +18" in 1yr)
+    lin_coadds = []
+    for i, (mjd, dx_arcsec) in enumerate(zip(mjds, [0.0, 9.0, 18.0])):
+        raw = _make_synthetic_spherex_me_fits(
+            ra, dec, angle_deg=10.0 * i, detector=6, mjd=mjd, star_offset_arcsec=(dx_arcsec, 0.0), include_epsf=False
+        )
+        p = tmp_path / f"lin_{i}.fits"
+        p.write_bytes(raw)
+        fd = fp.load_frame(p, f"lin_{i}/D6", 6, mjd)
+        lin_coadds.append(fp.coadd_epoch(i, [fd], grid))
+
+    diff_lin, snr_lin = fp.compute_difference_map(
+        lin_coadds[0].image, lin_coadds[0].variance, lin_coadds[2].image, lin_coadds[2].variance
+    )
+    anoms_lin = fp.detect_diff_anomalies(
+        diff_lin, snr_lin, grid, lin_coadds[0].mjd_mid, lin_coadds[2].mjd_mid, coadds=lin_coadds
+    )
+    dipoles_lin = [a for a in anoms_lin if a.anomaly_type == "moving_dipole"]
+    assert len(dipoles_lin) >= 1
+    assert dipoles_lin[0].motion_model == "linear_proper_motion"
+    assert dipoles_lin[0].parallax_arcsec is None
+
+    # 3. Parallax-dominated Planet X (8.5" parallax across May 2025 -> Nov 2025 -> May 2026)
+    plx_true = 8.5
+    p_alpha, p_delta = _parallax_factors(ra, dec, np.array(mjds))
+    cosd = np.cos(np.radians(dec))
+    plx_coadds = []
+    for i, mjd in enumerate(mjds):
+        dra_arcsec = float(plx_true * p_alpha[i] / cosd)
+        ddec_arcsec = float(plx_true * p_delta[i])
+        raw = _make_synthetic_spherex_me_fits(
+            ra, dec, angle_deg=5.0 * i, detector=6, mjd=mjd, star_offset_arcsec=(dra_arcsec, ddec_arcsec), include_epsf=False
+        )
+        p = tmp_path / f"plx_{i}.fits"
+        p.write_bytes(raw)
+        fd = fp.load_frame(p, f"plx_{i}/D6", 6, mjd)
+        plx_coadds.append(fp.coadd_epoch(i, [fd], grid))
+
+    # Compare May 2025 (0) vs Nov 2025 (1) while supplying all 3 epochs for trajectory fitting
+    diff_plx, snr_plx = fp.compute_difference_map(
+        plx_coadds[0].image, plx_coadds[0].variance, plx_coadds[1].image, plx_coadds[1].variance
+    )
+    anoms_plx = fp.detect_diff_anomalies(
+        diff_plx, snr_plx, grid, plx_coadds[0].mjd_mid, plx_coadds[1].mjd_mid, coadds=plx_coadds
+    )
+    dipoles_plx = [a for a in anoms_plx if a.anomaly_type == "moving_dipole"]
+    assert len(dipoles_plx) >= 1
+    assert dipoles_plx[0].motion_model == "parallax_dominated"
+    assert dipoles_plx[0].parallax_arcsec is not None
+    assert dipoles_plx[0].parallax_arcsec == pytest.approx(plx_true, abs=2.0)
+
 
 
 

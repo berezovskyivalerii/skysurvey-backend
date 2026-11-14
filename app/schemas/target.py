@@ -184,6 +184,7 @@ class Spectrum(_Model):
 
 # ------------------------------------------------------ difference imaging ---
 AnomalyType = Literal["moving_dipole", "variable_brightening", "variable_dimming"]
+MotionModel = Literal["linear_proper_motion", "parallax_dominated", "ambiguous"]
 
 
 class DiffAnomaly(_Model):
@@ -202,6 +203,14 @@ class DiffAnomaly(_Model):
     shift_arcsec: float | None = Field(None, description="Angular displacement between Epoch A and Epoch B (arcsec)")
     pm_arcsec_yr: float | None = Field(None, description="Estimated annualized proper motion (arcsec/yr)")
     delta_flux_ujy: float = Field(description="Peak aperture flux change between Epoch A and Epoch B (uJy)")
+    motion_model: MotionModel = Field(
+        "ambiguous",
+        description="Trajectory model across epochs: 'linear_proper_motion', 'parallax_dominated', or 'ambiguous'",
+    )
+    parallax_arcsec: float | None = Field(
+        None,
+        description="Estimated parallax amplitude (arcsec) when >=3 epochs are available",
+    )
 
 
 class DifferenceResult(_Model):

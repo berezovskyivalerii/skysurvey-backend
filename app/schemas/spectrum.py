@@ -25,6 +25,11 @@ class TargetCoords(_Base):
     dec: float = Field(description="Declination (ICRS degrees)")
 
 
+class SpectralModelPoint(_Base):
+    wavelength_um: float = Field(description="Wavelength in micrometres")
+    model_flux: float = Field(description="Fitted model flux density in uJy")
+
+
 class SpectrumSummary(_Base):
     total_channels: int = Field(102, description="Total SPHEREx LVF channels across Bands 1-6 (0.75-5.0 um)")
     valid_points: int = Field(description="Number of unflagged spectral channels with valid measurements")
@@ -42,6 +47,22 @@ class SpectrumSummary(_Base):
         description="Automated astrophysical classification hint derived from IR slope and S/N"
     )
     flux_unit: str = Field("uJy", description="Flux density unit (microjansky)")
+    estimated_temp_k: float | None = Field(
+        None,
+        description="Estimated effective temperature T_eff (K) in [200, 6000]",
+    )
+    ch4_absorption_depth: float | None = Field(
+        None,
+        description="Relative CH4 absorption depth around 3.2-3.4 um (0.0..1.0)",
+    )
+    h2o_absorption_depth: float | None = Field(
+        None,
+        description="Relative H2O absorption depth around 2.55-2.85 um (0.0..1.0)",
+    )
+    model_curve: list[SpectralModelPoint] = Field(
+        default_factory=list,
+        description="Smooth fitted Planck + molecular absorption curve",
+    )
 
 
 class ChartPoint(_Base):

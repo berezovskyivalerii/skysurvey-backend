@@ -43,6 +43,7 @@ from app.schemas.spectrum import (
     DEFAULT_ABSORPTION_BANDS,
     ChartPoint,
     SpectralHint,
+    SpectralModelPoint,
     SpectrumResponse,
     SpectrumSummary,
     TargetCoords,
@@ -323,6 +324,134 @@ def _classify_spectrum(
     return "insufficient_wavelength_coverage"
 
 
+def _planck_raw(wl_um: np.ndarray, temp_k: float) -> np.ndarray:
+    """Unnormalized Planck spectral radiance B_nu(lambda, T)."""
+    w = np.maximum(wl_um, 0.05)
+    x = np.clip(14387.77 / (w * max(temp_k, 1.0)), 1e-6, 700.0)
+    return (w ** -3.0) / np.expm1(x)
+
+
+def _in_absorption_band(wl_um: float) -> bool:
+    return any(band.range_um[0] <= wl_um <= band.range_um[1] for band in DEFAULT_ABSORPTION_BANDS)
+
+
+def _measure_band_depth(
+    pts: list[ChartPoint],
+    candidate_windows: list[tuple[float, float, float]],
+    temp_k: float,
+    abs_scale: float,
+) -> tuple[float | None, tuple[float, float] | None]:
+    """Return `(depth, (center_um, sigma_um))` for the first covered molecular window."""
+    for lo, hi, sigma in candidate_windows:
+        band_pts = [p for p in pts if lo <= p.wavelength_um <= hi and p.flux_error > 0]
+        if not band_pts:
+            continue
+        wls = np.array([p.wavelength_um for p in band_pts], dtype=np.float64)
+        obs = np.array([p.flux for p in band_pts], dtype=np.float64)
+        errs = np.array([p.flux_error for p in band_pts], dtype=np.float64)
+        weights = 1.0 / np.maximum(errs**2, 1e-18)
+
+        cont = abs_scale * _planck_raw(wls, temp_k)
+        denom = float(np.sum(weights * cont))
+        if denom <= 0:
+            continue
+        obs_weighted = float(np.sum(weights * obs))
+        depth = max(0.0, min(1.0, 1.0 - (obs_weighted / denom)))
+        return round(depth, 3), (0.5 * (lo + hi), sigma)
+    return None, None
+
+
+def fit_spectral_model(chart_data: list[ChartPoint]) -> dict[str, Any]:
+    """Fit a Planck continuum T_eff in [200 K, 6000 K] outside molecular bands and
+    estimate CH4 / H2O absorption depths plus a smooth 50-point model curve."""
+    active = [p for p in chart_data if not p.is_flagged and p.flux > 0 and p.flux_error > 0]
+    if len(active) < 2:
+        active = [p for p in chart_data if p.flux > 0 and p.flux_error > 0]
+    if len(active) < 2:
+        return {
+            "estimated_temp_k": None,
+            "ch4_absorption_depth": None,
+            "h2o_absorption_depth": None,
+            "model_curve": [],
+        }
+
+    continuum = [p for p in active if not _in_absorption_band(p.wavelength_um)]
+    fit_pts = continuum if len(continuum) >= 2 else active
+
+    wls = np.array([p.wavelength_um for p in fit_pts], dtype=np.float64)
+    fluxes = np.array([p.flux for p in fit_pts], dtype=np.float64)
+    errs = np.array([p.flux_error for p in fit_pts], dtype=np.float64)
+    weights = 1.0 / np.maximum(errs**2, 1e-18)
+
+    def _eval_temp(temp_k: float) -> tuple[float, float]:
+        raw = _planck_raw(wls, temp_k)
+        peak = float(np.max(raw)) if raw.size else 1.0
+        shape = raw / (peak if peak > 0 else 1.0)
+        denom = float(np.sum(weights * (shape**2)))
+        if denom <= 0:
+            return float("inf"), 0.0
+        scale_norm = max(0.0, float(np.sum(weights * fluxes * shape)) / denom)
+        chi2 = float(np.sum(weights * (fluxes - scale_norm * shape) ** 2))
+        abs_scale = scale_norm / (peak if peak > 0 else 1.0)
+        return chi2, abs_scale
+
+    best_temp = 1000.0
+    best_chi2 = float("inf")
+    best_abs_scale = 0.0
+
+    for t_cand in np.geomspace(200.0, 6000.0, 80):
+        chi2, abs_scale = _eval_temp(float(t_cand))
+        if chi2 < best_chi2:
+            best_chi2, best_temp, best_abs_scale = chi2, float(t_cand), abs_scale
+
+    t_lo = max(200.0, best_temp * 0.80)
+    t_hi = min(6000.0, best_temp * 1.25)
+    for t_cand in np.linspace(t_lo, t_hi, 45):
+        chi2, abs_scale = _eval_temp(float(t_cand))
+        if chi2 < best_chi2:
+            best_chi2, best_temp, best_abs_scale = chi2, float(t_cand), abs_scale
+
+    all_pts = [p for p in chart_data if not p.is_flagged and p.flux_error > 0]
+    if not all_pts:
+        all_pts = [p for p in chart_data if p.flux_error > 0]
+
+    ch4_depth, ch4_feat = _measure_band_depth(
+        all_pts,
+        [(3.20, 3.40, 0.10), (1.60, 1.70, 0.06), (2.15, 2.35, 0.10)],
+        best_temp,
+        best_abs_scale,
+    )
+    h2o_depth, h2o_feat = _measure_band_depth(
+        all_pts,
+        [(2.55, 2.85, 0.14), (1.80, 1.95, 0.08), (1.35, 1.45, 0.06)],
+        best_temp,
+        best_abs_scale,
+    )
+
+    curve_wls = np.linspace(0.75, 5.00, 50)
+    curve_flux = best_abs_scale * _planck_raw(curve_wls, best_temp)
+
+    if ch4_depth is not None and ch4_depth > 0.0 and ch4_feat is not None:
+        c0, sig = ch4_feat
+        curve_flux = curve_flux * (1.0 - ch4_depth * np.exp(-0.5 * ((curve_wls - c0) / sig) ** 2))
+    if h2o_depth is not None and h2o_depth > 0.0 and h2o_feat is not None:
+        c0, sig = h2o_feat
+        curve_flux = curve_flux * (1.0 - h2o_depth * np.exp(-0.5 * ((curve_wls - c0) / sig) ** 2))
+
+    curve_flux = np.maximum(curve_flux, 0.0)
+    model_curve = [
+        SpectralModelPoint(wavelength_um=round(float(wl), 4), model_flux=round(float(fl), 3))
+        for wl, fl in zip(curve_wls, curve_flux)
+    ]
+
+    return {
+        "estimated_temp_k": round(best_temp, 1),
+        "ch4_absorption_depth": ch4_depth,
+        "h2o_absorption_depth": h2o_depth,
+        "model_curve": model_curve,
+    }
+
+
 def extract_spectrum(
     fits_files: list[Path],
     ra: float,
@@ -444,6 +573,7 @@ def extract_spectrum(
             ir_color = round(f_l / denom, 3)
 
     hint = _classify_spectrum(ir_color, mean_snr, max_snr, peak_wl, chart_data)
+    model_fit = fit_spectral_model(chart_data)
 
     resp = SpectrumResponse(
         target=TargetCoords(ra=round(ra, 6), dec=round(dec, 6)),
@@ -458,6 +588,10 @@ def extract_spectrum(
             peak_flux_ujy=peak_flux,
             ir_color_index=ir_color,
             spectral_hint=hint,
+            estimated_temp_k=model_fit["estimated_temp_k"],
+            ch4_absorption_depth=model_fit["ch4_absorption_depth"],
+            h2o_absorption_depth=model_fit["h2o_absorption_depth"],
+            model_curve=model_fit["model_curve"],
         ),
         chart_data=chart_data,
         absorption_bands_reference=list(DEFAULT_ABSORPTION_BANDS),

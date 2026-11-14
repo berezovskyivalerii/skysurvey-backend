@@ -24,7 +24,7 @@ from app.services.fits_stream import NotFitsError, read_hdus
 from app.services.gaia_service import GaiaResult, GaiaService, propagate
 from app.services.irsa_service import Frame
 from app.services.solar_system_service import SolarSystemService
-from app.services.spectrum_extractor import extract_spectrum
+from app.services.spectrum_extractor import extract_spectrum, fit_spectral_model
 from app.services.wise_service import CATWISE_EPOCH_MJD, WiseResult, WiseService, propagate_wise
 
 
@@ -521,6 +521,56 @@ def test_solar_system_skybot_overlay():
     assert len(res[1]) == 1
     assert res[1][0].name == "Vesta"
     assert res[1][0].v_mag == pytest.approx(7.4, abs=0.01)
+
+
+def test_fit_spectral_model_brown_dwarf_and_star():
+    """Verify Planck Teff fitting and CH4/H2O absorption depth extraction."""
+    from app.schemas.spectrum import ChartPoint
+
+    def _make_sed(temp_k: float, scale: float, ch4_deep: float = 0.0, h2o_deep: float = 0.0) -> list[ChartPoint]:
+        wls = np.linspace(0.8, 4.9, 45)
+        pts: list[ChartPoint] = []
+        raw = (wls**-3.0) / np.expm1(np.clip(14387.77 / (wls * temp_k), 1e-6, 700.0))
+        raw = scale * raw / float(np.max(raw))
+        for idx, (wl, fl) in enumerate(zip(wls, raw), start=1):
+            if ch4_deep > 0.0 and 3.20 <= wl <= 3.40:
+                fl *= 1.0 - ch4_deep
+            if h2o_deep > 0.0 and 2.55 <= wl <= 2.85:
+                fl *= 1.0 - h2o_deep
+            det = min(6, max(1, int((wl - 0.75) / 0.71) + 1))
+            pts.append(
+                ChartPoint(
+                    channel_id=min(102, idx * 2),
+                    wavelength_um=float(wl),
+                    bandwidth_um=0.04,
+                    band=f"Band {det}",
+                    detector=det,
+                    flux=round(float(fl), 3),
+                    flux_error=max(0.5, 0.05 * float(fl)),
+                    snr=20.0,
+                    is_flagged=False,
+                    n_samples=2,
+                )
+            )
+        return pts
+
+    # 1. Cold 650 K T/Y brown dwarf with strong CH4 (3.3 um) and H2O (2.7 um) absorption
+    bd_pts = _make_sed(temp_k=650.0, scale=250.0, ch4_deep=0.65, h2o_deep=0.50)
+    bd_fit = fit_spectral_model(bd_pts)
+    assert bd_fit["estimated_temp_k"] is not None
+    assert 500.0 <= bd_fit["estimated_temp_k"] <= 800.0
+    assert bd_fit["ch4_absorption_depth"] == pytest.approx(0.65, abs=0.12)
+    assert bd_fit["h2o_absorption_depth"] == pytest.approx(0.50, abs=0.12)
+    assert len(bd_fit["model_curve"]) == 50
+
+    # 2. Hot 4500 K star without molecular absorption
+    star_pts = _make_sed(temp_k=4500.0, scale=1000.0, ch4_deep=0.0, h2o_deep=0.0)
+    star_fit = fit_spectral_model(star_pts)
+    assert star_fit["estimated_temp_k"] is not None
+    assert star_fit["estimated_temp_k"] >= 3500.0
+    assert (star_fit["ch4_absorption_depth"] or 0.0) < 0.1
+    assert (star_fit["h2o_absorption_depth"] or 0.0) < 0.1
+
 
 
 

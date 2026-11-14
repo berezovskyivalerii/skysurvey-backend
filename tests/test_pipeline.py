@@ -24,6 +24,7 @@ from app.services.fits_stream import NotFitsError, read_hdus
 from app.services.gaia_service import GaiaResult, GaiaService, propagate
 from app.services.irsa_service import Frame
 from app.services.spectrum_extractor import extract_spectrum
+from app.services.wise_service import CATWISE_EPOCH_MJD, WiseResult, WiseService, propagate_wise
 
 
 def _make_synthetic_spherex_me_fits(
@@ -250,9 +251,27 @@ def test_api_target_and_restretch(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
             # Empty optical catalog -> WISE 0855 should be classified as `candidate`!
             return GaiaResult(match_candidates=[], field=[])
 
+        async def _fake_wise(r: float, d: float):
+            return WiseResult(
+                sources=[
+                    {
+                        "source_id": "J085510.83-071442.5",
+                        "ra": r + 0.005,
+                        "dec": d,
+                        "pmra": -1700.0,
+                        "pmdec": 0.0,
+                        "w1mpro": 17.8,
+                        "w2mpro": 13.9,
+                        "w1snr": 4.2,
+                        "w2snr": 28.5,
+                    }
+                ]
+            )
+
         monkeypatch.setattr(pipeline.irsa, "query_frames", _fake_query_frames)
         monkeypatch.setattr(pipeline.irsa, "fetch_many", _fake_fetch_many)
         monkeypatch.setattr(pipeline.gaia, "query", _fake_gaia)
+        monkeypatch.setattr(pipeline.wise, "query", _fake_wise)
 
         # 1. Cold call -> full pipeline runs
         r1 = client.get("/api/v1/target", params={"ra": ra, "dec": dec, "fov": fov})
@@ -263,6 +282,9 @@ def test_api_target_and_restretch(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         assert len(body["epochs"]) == 2
         assert body["epochs"][0]["layers"]["rgb"] is not None
         assert body["crossmatch"]["classification"] == "candidate"
+        assert body["crossmatch"]["wise_match"] is not None
+        assert body["crossmatch"]["wise_match"]["is_ultracool_color"] is True
+        assert abs(body["crossmatch"]["wise_match"]["w1_w2_color"] - 3.9) < 0.01
         assert len(body["spectrum"]["points"]) == 102
         assert body["spectrum"]["n_channels_filled"] == 2
         assert body["spectrum_data"] is not None
@@ -351,4 +373,71 @@ def test_extract_spectrum_fallback_without_wcs_wave(tmp_path: Path):
     assert chart[0]["wavelength_um"] < chart[1]["wavelength_um"]
     assert chart[0]["band"] == "Band 1"
     assert chart[1]["band"] == "Band 6"
+
+
+def test_wise_crossmatch_and_propagation():
+    """Verify CatWISE2020 proper-motion propagation, W1-W2 color, AllWISE fallback, and 10yr baseline PM."""
+    import httpx
+
+    cfg = Settings(supabase_url="", supabase_key="")
+    wise = WiseService(cfg)
+
+    # Simulate an ultracool Y dwarf observed by CatWISE2020 at MJD 57170 (~2015.4)
+    # moving -8100 mas/yr in RA*cos(dec) over 10.5 years to SPHEREx MJD 61005.125
+    target_ra = 133.7951
+    target_dec = -7.2451
+    dt_yr = (61005.125 - CATWISE_EPOCH_MJD) / 365.25
+    cosd = np.cos(np.radians(target_dec))
+    catwise_ra0 = (target_ra - (-8100.0) * dt_yr / 3.6e6 / cosd) % 360.0
+
+    src = {
+        "source_id": "WISEA_J0855",
+        "ra": catwise_ra0,
+        "dec": target_dec,
+        "pmra": -8.1,  # arcsec/yr
+        "pmdec": 0.0,
+        "pm_unit": "arcsec/yr",
+        "w1mpro": 17.9,
+        "w2mpro": 13.8,
+        "w1snr": 3.5,
+        "w2snr": 32.0,
+    }
+    ra_prop, dec_prop = propagate_wise(src, mjd=61005.125)
+    assert abs(ra_prop - target_ra) * 3600.0 < 0.1
+    assert abs(dec_prop - target_dec) < 1e-6
+
+    res = WiseResult(sources=[src], catalog="CatWISE2020", epoch_mjd=CATWISE_EPOCH_MJD)
+    match = wise.best_match(res, target_ra, target_dec, mjd=61005.125, spherex_ra=target_ra, spherex_dec=target_dec)
+    assert match is not None
+    assert match.source_id == "WISEA_J0855"
+    assert match.separation_arcsec < 0.2
+    assert match.w1_w2_color == pytest.approx(4.1, abs=0.01)
+    assert match.is_ultracool_color is True
+    assert match.baseline_pm_arcsec_yr == pytest.approx(8.1, abs=0.1)
+
+    # Test HTTP CSV parsing + automatic fallback from catwise_2020 to allwise_p3as_psd
+    calls: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode("utf-8")
+        calls.append(body)
+        if "catwise_2020" in body:
+            return httpx.Response(503, text="CatWISE unavailable")
+        csv_text = (
+            "source_id,ra,dec,w1mpro,w2mpro,w1snr,w2snr\n"
+            f"ALLWISE_001,{target_ra},{target_dec},15.2,13.4,12.0,25.0\n"
+        )
+        return httpx.Response(200, text=csv_text)
+
+    async def _run_fallback():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as client:
+            svc = WiseService(cfg, client)
+            return await svc.query(target_ra, target_dec)
+
+    fb_res = asyncio.run(_run_fallback())
+    assert len(calls) == 2
+    assert fb_res.catalog == "AllWISE"
+    assert len(fb_res.sources) == 1
+    assert fb_res.sources[0]["source_id"] == "ALLWISE_001"
+
 

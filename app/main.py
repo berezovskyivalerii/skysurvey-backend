@@ -17,6 +17,7 @@ from app.services.gaia_service import GaiaService
 from app.services.irsa_service import IrsaService
 from app.services.pipeline import PipelineService
 from app.services.supabase_service import SupabaseService
+from app.services.wise_service import WiseService
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
@@ -48,13 +49,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True) as http:
             irsa = IrsaService(cfg, http, cache)
             gaia = GaiaService(cfg, http)
+            wise = WiseService(cfg, http)
             db = SupabaseService(cfg, http)
-            pipeline = PipelineService(cfg, cache, irsa, gaia, db)
+            pipeline = PipelineService(cfg, cache, irsa, gaia, db, wise=wise)
 
             app.state.settings = cfg
             app.state.cache = cache
             app.state.irsa = irsa
             app.state.gaia = gaia
+            app.state.wise = wise
             app.state.db = db
             app.state.pipeline = pipeline
 

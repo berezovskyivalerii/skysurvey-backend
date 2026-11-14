@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     gaia_overlay_max_sources: int = 500
     gaia_timeout_s: float = 30.0
 
+    # --- WISE (CatWISE2020 / AllWISE) ---
+    wise_table: str = "catwise_2020"
+    allwise_table: str = "allwise_p3as_psd"
+    wise_search_radius_deg: float = 0.02
+    wise_match_radius_arcsec: float = 10.0
+    wise_timeout_s: float = 15.0
+
     # --- rendering ---
     png_size: int = 512
     png_resample: str = "nearest"  # nearest keeps SPHEREx pixels crisp (WiseView style)

@@ -111,11 +111,34 @@ class OverlaySource(_Model):
     y: float = Field(description="PNG pixel y (0..height, top-left origin)")
 
 
+class WiseSource(_Model):
+    source_id: str
+    catalog: str = Field("CatWISE2020", description="IR catalog name ('CatWISE2020' or 'AllWISE')")
+    ra: float = Field(description="Catalog RA at WISE epoch (ICRS deg)")
+    dec: float = Field(description="Catalog Dec at WISE epoch (ICRS deg)")
+    ra_obs: float = Field(description="RA propagated to SPHEREx observation epoch (ICRS deg)")
+    dec_obs: float = Field(description="Dec propagated to SPHEREx observation epoch (ICRS deg)")
+    separation_arcsec: float = Field(description="Angular separation from query position at SPHEREx epoch (arcsec)")
+    w1mpro: float | None = Field(None, description="WISE W1 (3.35 um) magnitude")
+    w2mpro: float | None = Field(None, description="WISE W2 (4.60 um) magnitude")
+    w1_w2_color: float | None = Field(None, description="W1 - W2 color (mag); > 1.5 mag indicates cold T/Y brown dwarf")
+    w1snr: float | None = None
+    w2snr: float | None = None
+    pmra_mas_yr: float | None = Field(None, description="Proper motion in RA*cos(dec) (mas/yr)")
+    pmdec_mas_yr: float | None = Field(None, description="Proper motion in Dec (mas/yr)")
+    baseline_pm_arcsec_yr: float | None = Field(
+        None,
+        description="10-year baseline proper motion between WISE (2015.4) and SPHEREx epoch (arcsec/yr)",
+    )
+    is_ultracool_color: bool = Field(False, description="True if (W1 - W2) >= 1.5 mag")
+
+
 class CrossMatch(_Model):
     classification: Classification
     reason: str
     catalog: str = "Gaia DR3"
     match: GaiaMatch | None = None
+    wise_match: WiseSource | None = None
     spherex_snr: float | None = Field(None, description="IR detection S/N at target in the stacked co-add")
     high_proper_motion: bool = False
     overlay: list[OverlaySource] = []

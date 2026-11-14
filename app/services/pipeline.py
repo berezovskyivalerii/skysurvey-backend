@@ -34,6 +34,7 @@ from app.services.gaia_service import GaiaResult, GaiaService
 from app.services.irsa_service import Epoch, Frame, IrsaService
 from app.services.spectrum_extractor import extract_spectrum, find_covering_fits
 from app.services.supabase_service import SupabaseService
+from app.services.wise_service import WiseResult, WiseService
 
 log = logging.getLogger(__name__)
 
@@ -46,12 +47,14 @@ class PipelineService:
         irsa: IrsaService,
         gaia: GaiaService,
         db: SupabaseService,
+        wise: WiseService | None = None,
     ):
         self.s = settings
         self.cache = cache
         self.irsa = irsa
         self.gaia = gaia
         self.db = db
+        self.wise = wise or WiseService(settings, irsa.http)
         self._inflight: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._bg_tasks: set[asyncio.Task[Any]] = set()
 
@@ -206,23 +209,25 @@ class PipelineService:
             "classification": "unknown",
             "pipeline_version": self.s.pipeline_version,
             "n_observations": 0,
-            "progress": {"stage": "Querying IRSA TAP & Gaia DR3", "percent": 10},
+            "progress": {"stage": "Querying IRSA TAP, Gaia DR3 & CatWISE2020", "percent": 10},
             "epochs": [],
             "error": None,
         }
         await self.db.upsert_target(base_row)
 
         try:
-            # Step 3 & 4a in parallel: Gaia DR3 cone search + IRSA TAP ObsCore query
-            frames, gaia_res = await asyncio.gather(
+            # Step 3 & 4a in parallel: IRSA TAP ObsCore + Gaia DR3 + CatWISE2020 cone searches
+            frames, gaia_res, wise_res = await asyncio.gather(
                 self.irsa.query_frames(ra, dec),
                 self.gaia.query(ra, dec, fov),
+                self.wise.query(ra, dec),
             )
             if not frames:
                 grid = fp.make_grid(ra, dec, fov, self.s.spherex_pixel_scale_arcsec, self.s.png_size)
                 mjd_ref = 61000.0
                 gmatch = self.gaia.best_match(gaia_res, ra, dec, mjd_ref)
                 xmatch = self.gaia.classify(gmatch, None, gaia_res.error)
+                xmatch.wise_match = self.wise.best_match(wise_res, ra, dec, mjd_ref)
                 xmatch.overlay = self.gaia.overlay(gaia_res, mjd_ref, grid.world_to_png)
                 no_data_row = {
                     **base_row,
@@ -279,6 +284,7 @@ class PipelineService:
                 display_by_epoch,
                 path_by_key,
                 gaia_res,
+                wise_res,
             )
 
             # Upload all epoch PNGs + co-add FITS to Supabase Storage concurrently
@@ -406,6 +412,7 @@ class PipelineService:
         display_by_epoch: list[tuple[Epoch, list[Frame]]],
         path_by_key: dict[str, Path],
         gaia_res: GaiaResult,
+        wise_res: WiseResult | None = None,
     ) -> dict[str, Any]:
         grid = fp.make_grid(ra, dec, fov, self.s.spherex_pixel_scale_arcsec, self.s.png_size)
         coadds: list[fp.EpochCoadd] = []
@@ -483,6 +490,19 @@ class PipelineService:
         stack_img, stack_var = fp.deep_stack(coadds)
         snr = fp.aperture_snr(stack_img, stack_var, grid, phot_ra, phot_dec, search_px=1)
         xmatch = self.gaia.classify(gmatch, round(snr, 2) if snr is not None else None, gaia_res.error)
+        wmatch = (
+            self.wise.best_match(wise_res, ra, dec, mean_mjd, spherex_ra=phot_ra, spherex_dec=phot_dec)
+            if wise_res is not None
+            else None
+        )
+        xmatch.wise_match = wmatch
+        if xmatch.classification == "candidate" and wmatch is not None:
+            extras = [f"Matched {wmatch.catalog} {wmatch.source_id} (sep={wmatch.separation_arcsec:.1f}\")"]
+            if wmatch.w1_w2_color is not None:
+                extras.append(f"W1-W2={wmatch.w1_w2_color:.2f} mag")
+            if wmatch.baseline_pm_arcsec_yr is not None:
+                extras.append(f"10yr baseline PM={wmatch.baseline_pm_arcsec_yr:.2f}\"/yr")
+            xmatch.reason = f"{xmatch.reason} | {'; '.join(extras)}"
         xmatch.overlay = self.gaia.overlay(gaia_res, mean_mjd, grid.world_to_png)
 
         # Difference imaging (Epoch_last - Epoch_0) + Deep Stack + Dipole/Variable detection

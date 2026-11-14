@@ -23,6 +23,7 @@ from app.services.cache_manager import FitsCache
 from app.services.fits_stream import NotFitsError, read_hdus
 from app.services.gaia_service import GaiaResult, GaiaService, propagate
 from app.services.irsa_service import Frame
+from app.services.solar_system_service import SolarSystemService
 from app.services.spectrum_extractor import extract_spectrum
 from app.services.wise_service import CATWISE_EPOCH_MJD, WiseResult, WiseService, propagate_wise
 
@@ -268,10 +269,37 @@ def test_api_target_and_restretch(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
                 ]
             )
 
+        async def _fake_skybot(r: float, d: float, fv: float, mjds: list[float], world_to_png=None):
+            from app.schemas.target import MinorPlanetOverlay
+
+            out = []
+            for idx_m, _m in enumerate(mjds):
+                if idx_m == 0:
+                    xy = world_to_png(r, d) if world_to_png else (64.0, 64.0)
+                    out.append(
+                        [
+                            MinorPlanetOverlay(
+                                number="433",
+                                name="Eros",
+                                object_type="MBA",
+                                ra=r,
+                                dec=d,
+                                v_mag=14.2,
+                                separation_arcsec=0.0,
+                                x=xy[0] if xy else 64.0,
+                                y=xy[1] if xy else 64.0,
+                            )
+                        ]
+                    )
+                else:
+                    out.append([])
+            return out
+
         monkeypatch.setattr(pipeline.irsa, "query_frames", _fake_query_frames)
         monkeypatch.setattr(pipeline.irsa, "fetch_many", _fake_fetch_many)
         monkeypatch.setattr(pipeline.gaia, "query", _fake_gaia)
         monkeypatch.setattr(pipeline.wise, "query", _fake_wise)
+        monkeypatch.setattr(pipeline.solar_system, "query_epochs", _fake_skybot)
 
         # 1. Cold call -> full pipeline runs
         r1 = client.get("/api/v1/target", params={"ra": ra, "dec": dec, "fov": fov})
@@ -281,6 +309,9 @@ def test_api_target_and_restretch(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         assert body["cache"]["hit"] is False
         assert len(body["epochs"]) == 2
         assert body["epochs"][0]["layers"]["rgb"] is not None
+        assert len(body["epochs"][0]["known_minor_planets"]) == 1
+        assert body["epochs"][0]["known_minor_planets"][0]["name"] == "Eros"
+        assert body["epochs"][1]["known_minor_planets"] == []
         assert body["crossmatch"]["classification"] == "candidate"
         assert body["crossmatch"]["wise_match"] is not None
         assert body["crossmatch"]["wise_match"]["is_ultracool_color"] is True
@@ -439,5 +470,57 @@ def test_wise_crossmatch_and_propagation():
     assert fb_res.catalog == "AllWISE"
     assert len(fb_res.sources) == 1
     assert fb_res.sources[0]["source_id"] == "ALLWISE_001"
+
+
+def test_solar_system_skybot_overlay():
+    """Verify IMCCE SkyBoT JSON + pipe-text parsing, sexagesimal conversion, and PNG coordinate projection."""
+    import json
+
+    import httpx
+
+    ra, dec = 133.7951, -7.2451
+    grid = fp.make_grid(ra, dec, fov=0.1, pixscale_arcsec=6.15, png_size=512)
+    cfg = Settings(supabase_url="", supabase_key="", skybot_enabled=True)
+
+    # JSON response with fields + sexagesimal RA (08 55 10.82 = 133.7951 deg) and Dec (-07 14 42.36 = -7.2451 deg)
+    json_payload = json.dumps(
+        {
+            "fields": ["num", "name", "ra", "dec", "class", "vmag", "errpos", "d", "dra", "ddec"],
+            "data": [
+                ["1", "Ceres", "08 55 10.824", "-07 14 42.36", "MBA", 8.1, 0.1, 0.0, -25.4, 12.1],
+                ["999", "FarAway", 140.0, 20.0, "MBA", 18.5, 0.2, 5000.0, 1.0, 1.0],
+            ],
+        }
+    )
+    pipe_payload = (
+        "# Flag : 1\n"
+        "# num | name | ra | dec | class | vmag | errpos | d | dra | ddec\n"
+        f"4 | Vesta | {ra + 0.01} | {dec - 0.01} | MBA | 7.4 | 0.1 | 40.0 | -18.0 | 5.2\n"
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        ep = float(request.url.params.get("-ep", "60800"))
+        if ep < 60900:
+            return httpx.Response(200, text=json_payload)
+        return httpx.Response(200, text=pipe_payload)
+
+    async def _run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as client:
+            svc = SolarSystemService(cfg, client)
+            return await svc.query_epochs(ra, dec, 0.1, [60850.0, 61040.0], grid.world_to_png)
+
+    res = asyncio.run(_run())
+    assert len(res) == 2
+    assert len(res[0]) == 1  # FarAway filtered out because outside PNG bounds
+    assert res[0][0].name == "Ceres"
+    assert res[0][0].number == "1"
+    assert 250.0 <= res[0][0].x <= 262.0
+    assert 250.0 <= res[0][0].y <= 262.0
+    assert res[0][0].dra_arcsec_hr == pytest.approx(-25.4, abs=0.01)
+
+    assert len(res[1]) == 1
+    assert res[1][0].name == "Vesta"
+    assert res[1][0].v_mag == pytest.approx(7.4, abs=0.01)
+
 
 

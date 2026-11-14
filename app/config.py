@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     wise_match_radius_arcsec: float = 10.0
     wise_timeout_s: float = 15.0
 
+    # --- Solar System (IMCCE SkyBoT) ---
+    skybot_url: str = "https://vo.imcce.fr/webservices/skybot/skybotconesearch_query.php"
+    skybot_timeout_s: float = 8.0
+    skybot_enabled: bool = True
+
     # --- rendering ---
     png_size: int = 512
     png_resample: str = "nearest"  # nearest keeps SPHEREx pixels crisp (WiseView style)

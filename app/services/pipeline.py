@@ -33,6 +33,7 @@ from app.services.cache_manager import FitsCache
 from app.services.gaia_service import GaiaResult, GaiaService
 from app.services.irsa_service import Epoch, Frame, IrsaService
 from app.services.spectrum_extractor import extract_spectrum, find_covering_fits
+from app.services.solar_system_service import SolarSystemService
 from app.services.supabase_service import SupabaseService
 from app.services.wise_service import WiseResult, WiseService
 
@@ -48,6 +49,7 @@ class PipelineService:
         gaia: GaiaService,
         db: SupabaseService,
         wise: WiseService | None = None,
+        solar_system: SolarSystemService | None = None,
     ):
         self.s = settings
         self.cache = cache
@@ -55,6 +57,7 @@ class PipelineService:
         self.gaia = gaia
         self.db = db
         self.wise = wise or WiseService(settings, irsa.http)
+        self.solar_system = solar_system or SolarSystemService(settings, irsa.http)
         self._inflight: dict[str, asyncio.Task[dict[str, Any]]] = {}
         self._bg_tasks: set[asyncio.Task[Any]] = set()
 
@@ -287,11 +290,15 @@ class PipelineService:
                 wise_res,
             )
 
-            # Upload all epoch PNGs + co-add FITS to Supabase Storage concurrently
-            url_map = await self.db.upload_many(cpu_res["uploads"])
+            # Upload all epoch PNGs + co-add FITS to Supabase Storage and query SkyBoT concurrently
+            epoch_mjds = [ep_info["coadd"].mjd_mid for ep_info in cpu_res["epochs_info"]]
+            url_map, minor_planets_by_epoch = await asyncio.gather(
+                self.db.upload_many(cpu_res["uploads"]),
+                self.solar_system.query_epochs(ra, dec, fov, epoch_mjds, cpu_res["grid"].world_to_png),
+            )
 
             epochs_out: list[EpochOut] = []
-            for ep_info in cpu_res["epochs_info"]:
+            for idx_ep, ep_info in enumerate(cpu_res["epochs_info"]):
                 c: fp.EpochCoadd = ep_info["coadd"]
                 epochs_out.append(
                     EpochOut(
@@ -310,6 +317,7 @@ class PipelineService:
                             rgb=url_map.get(ep_info["rgb_path"]),
                         ),
                         coadd_fits_url=url_map[ep_info["coadd_fits_path"]],
+                        known_minor_planets=minor_planets_by_epoch[idx_ep],
                     )
                 )
 
@@ -570,6 +578,7 @@ class PipelineService:
         return {
             "uploads": uploads,
             "epochs_info": epochs_info,
+            "grid": grid,
             "crossmatch": xmatch,
             "display": display,
             "samples": samples,

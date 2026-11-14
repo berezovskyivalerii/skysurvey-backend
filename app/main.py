@@ -16,6 +16,7 @@ from app.services.cache_manager import FitsCache
 from app.services.gaia_service import GaiaService
 from app.services.irsa_service import IrsaService
 from app.services.pipeline import PipelineService
+from app.services.solar_system_service import SolarSystemService
 from app.services.supabase_service import SupabaseService
 from app.services.wise_service import WiseService
 
@@ -50,14 +51,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             irsa = IrsaService(cfg, http, cache)
             gaia = GaiaService(cfg, http)
             wise = WiseService(cfg, http)
+            solar_system = SolarSystemService(cfg, http)
             db = SupabaseService(cfg, http)
-            pipeline = PipelineService(cfg, cache, irsa, gaia, db, wise=wise)
+            pipeline = PipelineService(cfg, cache, irsa, gaia, db, wise=wise, solar_system=solar_system)
 
             app.state.settings = cfg
             app.state.cache = cache
             app.state.irsa = irsa
             app.state.gaia = gaia
             app.state.wise = wise
+            app.state.solar_system = solar_system
             app.state.db = db
             app.state.pipeline = pipeline
 

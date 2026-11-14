@@ -69,6 +69,20 @@ class LayerUrls(_Model):
     )
 
 
+class MinorPlanetOverlay(_Model):
+    number: str | None = None
+    name: str
+    object_type: str = "Asteroid"
+    ra: float
+    dec: float
+    v_mag: float | None = None
+    dra_arcsec_hr: float | None = None
+    ddec_arcsec_hr: float | None = None
+    separation_arcsec: float
+    x: float
+    y: float
+
+
 class EpochOut(_Model):
     index: int
     label: str = Field(description="Human label, e.g. '2025-10'")
@@ -80,6 +94,10 @@ class EpochOut(_Model):
     detectors: list[int]
     layers: LayerUrls
     coadd_fits_url: str | None = Field(None, description="Small float32 FITS of the co-add (for power users)")
+    known_minor_planets: list[MinorPlanetOverlay] = Field(
+        default_factory=list,
+        description="Known Solar System asteroids/comets in FOV at mjd_mid",
+    )
 
 
 # -------------------------------------------------------------- crossmatch ---

@@ -637,6 +637,71 @@ def test_astrometry_fitter_linear_vs_parallax(tmp_path: Path):
     assert dipoles_plx[0].parallax_arcsec == pytest.approx(plx_true, abs=2.0)
 
 
+def test_warmup_presets_script():
+    """Verify warmup_presets selects PRESET_TARGETS, forwards force, and validates deploy configs."""
+    import asyncio
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from app.api.v1.targets import PRESET_TARGETS
+    from scripts.warmup_presets import main as warmup_main
+    from scripts.warmup_presets import warmup_all
+
+    class _FakePipeline:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def get_target(self, *, ra, dec, fov, band, sync, force_refresh):
+            self.calls.append(
+                {
+                    "ra": ra,
+                    "dec": dec,
+                    "fov": fov,
+                    "band": band,
+                    "sync": sync,
+                    "force_refresh": force_refresh,
+                }
+            )
+            return SimpleNamespace(
+                target_key=f"spherex:{ra:.5f}:{dec:.5f}:{band}",
+                status="ready",
+                epochs=[object(), object()],
+                crossmatch=SimpleNamespace(classification="candidate"),
+                cache=SimpleNamespace(hit=False),
+                error=None,
+            )
+
+    fake = _FakePipeline()
+    all_results = asyncio.run(warmup_all(force=False, pipeline=fake))
+    assert len(all_results) == len(PRESET_TARGETS)
+    assert len(fake.calls) == len(PRESET_TARGETS)
+    assert all(r["ok"] and r["status"] == "ready" and r["epochs"] == 2 for r in all_results)
+    assert all(c["sync"] is True and c["force_refresh"] is False for c in fake.calls)
+
+    fake_single = _FakePipeline()
+    single_results = asyncio.run(
+        warmup_all(force=True, target_id="wise_0855", pipeline=fake_single)
+    )
+    assert len(single_results) == 1
+    assert single_results[0]["id"] == "wise_0855"
+    assert len(fake_single.calls) == 1
+    assert fake_single.calls[0]["force_refresh"] is True
+
+    dry_results = asyncio.run(warmup_all(dry_run=True))
+    assert len(dry_results) == len(PRESET_TARGETS)
+    assert all(r["status"] == "dry_run" and r["ok"] for r in dry_results)
+
+    assert warmup_main(["--dry-run", "--target", "barnards_star"]) == 0
+    assert warmup_main(["--dry-run", "--target", "nonexistent_target"]) == 2
+
+    repo_root = Path(__file__).resolve().parent.parent
+    railway_cfg = json.loads((repo_root / "railway.json").read_text(encoding="utf-8"))
+    assert railway_cfg["build"]["builder"] == "DOCKERFILE"
+    assert railway_cfg["deploy"]["healthcheckPath"] == "/health"
+    assert (repo_root / "render.yaml").exists()
+
+
 
 
 

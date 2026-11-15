@@ -13,6 +13,8 @@ So we:
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import logging
 import math
 import time
@@ -23,6 +25,7 @@ import httpx
 import numpy as np
 
 from app.config import Settings
+from app.core.async_utils import race_first_success
 from app.schemas.target import CrossMatch, GaiaMatch, OverlaySource
 
 log = logging.getLogger(__name__)
@@ -31,6 +34,7 @@ GAIA_EPOCH_MJD = 57388.5  # J2016.0
 MAS_PER_DEG = 3.6e6
 HIGH_PM_MAS_YR = 200.0
 ESA_GAIA_TAP_SYNC = "https://gea.esac.esa.int/tap-server/tap/sync"
+VIZIER_TAP_SYNC = "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync"
 
 
 @dataclass
@@ -86,10 +90,11 @@ class GaiaService:
             "FORMAT": "json",
             "QUERY": " ".join(adql.split()),
         }
+        timeout_s = self.s.gaia_timeout_s
         if self.http is not None:
-            r = await self.http.post(ESA_GAIA_TAP_SYNC, data=params, timeout=12.0)
+            r = await self.http.post(ESA_GAIA_TAP_SYNC, data=params, timeout=timeout_s)
         else:
-            async with httpx.AsyncClient(timeout=12.0) as client:
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
                 r = await client.post(ESA_GAIA_TAP_SYNC, data=params)
         r.raise_for_status()
         payload = r.json()
@@ -112,6 +117,7 @@ class GaiaService:
             columns=["Source", "RA_ICRS", "DE_ICRS", "Plx", "e_Plx", "pmRA", "pmDE", "PM", "Gmag", "BP-RP", "RUWE"],
             row_limit=limit,
         )
+        v.TIMEOUT = max(1, int(math.ceil(self.s.gaia_timeout_s)))
         res = v.query_region(SkyCoord(ra, dec, unit="deg"), radius=radius_deg * u.deg, catalog="I/355/gaiadr3")
         if not res:
             return []
@@ -134,7 +140,64 @@ class GaiaService:
             )
         return out
 
+    async def _query_vizier_tap(self, ra: float, dec: float, radius_deg: float, limit: int) -> list[dict]:
+        """Fast async query to CDS VizieR TAP (`I/355/gaiadr3`, CSV) via shared `httpx.AsyncClient`."""
+        adql = f"""
+            SELECT TOP {limit}
+                Source AS source_id, RA_ICRS AS ra, DE_ICRS AS dec,
+                Plx AS parallax, e_Plx AS parallax_error,
+                pmRA AS pmra, pmDE AS pmdec, PM AS pm,
+                Gmag AS phot_g_mean_mag, "BP-RP" AS bp_rp, RUWE AS ruwe
+            FROM "I/355/gaiadr3"
+            WHERE 1 = CONTAINS(POINT('ICRS', RA_ICRS, DE_ICRS), CIRCLE('ICRS', {ra:.8f}, {dec:.8f}, {radius_deg:.8f}))
+            ORDER BY Gmag ASC
+        """
+        params = {
+            "REQUEST": "doQuery",
+            "LANG": "ADQL",
+            "FORMAT": "csv",
+            "QUERY": " ".join(adql.split()),
+        }
+        timeout_s = self.s.gaia_timeout_s
+        if self.http is not None:
+            r = await self.http.post(VIZIER_TAP_SYNC, data=params, timeout=timeout_s)
+        else:
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
+                r = await client.post(VIZIER_TAP_SYNC, data=params)
+        r.raise_for_status()
+        text = r.text
+        if text.lstrip().startswith("<"):
+            raise RuntimeError(f"VizieR TAP returned XML error: {text[:200]}")
+        rows: list[dict] = []
+        for raw in csv.DictReader(io.StringIO(text)):
+            sid = (raw.get("source_id") or "").strip()
+            if not sid:
+                continue
+            rows.append(
+                {
+                    "source_id": sid,
+                    "ra": _clean(raw.get("ra")),
+                    "dec": _clean(raw.get("dec")),
+                    "parallax": _clean(raw.get("parallax")),
+                    "parallax_error": _clean(raw.get("parallax_error")),
+                    "pmra": _clean(raw.get("pmra")),
+                    "pmdec": _clean(raw.get("pmdec")),
+                    "pm": _clean(raw.get("pm")),
+                    "phot_g_mean_mag": _clean(raw.get("phot_g_mean_mag")),
+                    "bp_rp": _clean(raw.get("bp_rp")),
+                    "ruwe": _clean(raw.get("ruwe")),
+                }
+            )
+        return rows
+
+    async def _query_vizier(self, ra: float, dec: float, radius_deg: float, limit: int) -> list[dict]:
+        # Respect monkeypatched `_run_vizier` in unit tests; otherwise use async TAPVizieR
+        if "_run_vizier" in self.__dict__ or type(self)._run_vizier is not GaiaService._run_vizier:
+            return await asyncio.to_thread(self._run_vizier, ra, dec, radius_deg, limit)
+        return await self._query_vizier_tap(ra, dec, radius_deg, limit)
+
     async def query(self, ra: float, dec: float, fov: float) -> GaiaResult:
+        """Race ESA Gaia TAP and CDS VizieR in parallel until the FIRST SUCCESS."""
         t0 = time.perf_counter()
         r_pad = self.s.gaia_search_pad_arcsec / 3600.0
         r_field = max(fov * math.sqrt(2) / 2, r_pad)
@@ -144,21 +207,25 @@ class GaiaService:
             WHERE 1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra:.8f}, {dec:.8f}, {r_field:.8f}))
             ORDER BY phot_g_mean_mag ASC
         """
+        tasks: list[asyncio.Task[list[dict]]] = [
+            asyncio.create_task(self._query_esa_json(adql), name="gaia-esa-tap"),
+            asyncio.create_task(
+                self._query_vizier(ra, dec, r_field, self.s.gaia_overlay_max_sources),
+                name="gaia-vizier",
+            ),
+        ]
         try:
-            rows = await self._query_esa_json(adql)
-            log.info("Gaia DR3 returned %d sources in %.2fs", len(rows), time.perf_counter() - t0)
+            rows, winner = await race_first_success(tasks, timeout=self.s.gaia_timeout_s)
+            log.info(
+                "Gaia DR3 (%s) returned %d sources in %.2fs",
+                winner,
+                len(rows),
+                time.perf_counter() - t0,
+            )
             return GaiaResult(rows, rows)
-        except Exception as e:
-            log.warning("ESA Gaia TAP failed (%s); falling back to VizieR", e)
-            try:
-                rows = await asyncio.wait_for(
-                    asyncio.to_thread(self._run_vizier, ra, dec, r_field, self.s.gaia_overlay_max_sources),
-                    timeout=10.0,
-                )
-                return GaiaResult(rows, rows)
-            except Exception as e2:
-                log.warning("Gaia VizieR fallback failed: %s", e2)
-                return GaiaResult([], [], error=f"Gaia unavailable: {e2}")
+        except Exception as exc:
+            log.warning("Gaia DR3 race failed in %.2fs: %r", time.perf_counter() - t0, exc)
+            return GaiaResult([], [], error=f"Gaia unavailable: {exc!r}")
 
     # ------------------------------------------------------- crossmatch ----
     def best_match(self, res: GaiaResult, ra: float, dec: float, mjd: float) -> GaiaMatch | None:

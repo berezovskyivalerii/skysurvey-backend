@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 
 from app.schemas.spectrum import SpectrumResponse
 from app.schemas.target import (
@@ -92,6 +92,7 @@ PRESET_TARGETS = [
 )
 async def get_target_endpoint(
     response: Response,
+    background_tasks: BackgroundTasks,
     pipeline: Annotated[PipelineService, Depends(get_pipeline)],
     ra: Annotated[float, Query(ge=0.0, lt=360.0, description="Right Ascension (ICRS degrees)", examples=[133.7951])],
     dec: Annotated[float, Query(ge=-90.0, le=90.0, description="Declination (ICRS degrees)", examples=[-7.2451])],
@@ -100,6 +101,10 @@ async def get_target_endpoint(
     sync: Annotated[
         bool,
         Query(description="Wait for Phase-1 completion before returning. Set false for instant 202 polling."),
+    ] = True,
+    fast: Annotated[
+        bool,
+        Query(description="Fast Cold Start: compute spectrum only from display cutouts without scanning/downloading extra exposures."),
     ] = True,
     force_refresh: Annotated[bool, Query(description="Bypass DB cache and re-run the pipeline")] = False,
 ) -> TargetResponse:
@@ -111,6 +116,8 @@ async def get_target_endpoint(
             band=band,
             sync=sync,
             force_refresh=force_refresh,
+            fast=fast,
+            background_tasks=background_tasks,
         )
     except TimeoutError as e:
         raise HTTPException(status_code=504, detail=f"Upstream archive timed out: {e}") from e

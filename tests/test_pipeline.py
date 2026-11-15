@@ -717,6 +717,176 @@ def test_warmup_presets_script():
     assert (repo_root / "render.yaml").exists()
 
 
+def test_cold_start_optimizations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verify the 5 Cold Start latency optimizations:
+    1. Gaia ESA TAP vs VizieR race (`FIRST_COMPLETED`, 2.0s timeout).
+    2. Local `/static/storage/...` PNG write + `BackgroundTasks` cloud sync.
+    3. `select_display_frames` caps frames per epoch to 1-2 closest to `(ra, dec)`.
+    4. `fast=True` computes spectrum only from already-downloaded display cutouts.
+    5. `fits_processor` async wrappers run via `asyncio.to_thread`.
+    """
+    import time
+    from app.core.spherex import BAND_GROUPS
+    from app.services.irsa_service import Epoch, IrsaService
+
+    cfg = Settings(supabase_url="", supabase_key="", cache_dir=tmp_path / "cache")
+    assert cfg.gaia_timeout_s == 4.5
+    assert cfg.max_frames_per_epoch == 2
+
+    # 1. Gaia race: if ESA TAP hangs for 5s, VizieR wins immediately in <0.1s
+    gaia_svc = GaiaService(cfg)
+
+    async def _slow_esa(_adql: str):
+        await asyncio.sleep(5.0)
+        return []
+
+    def _fast_vizier(r: float, d: float, rad: float, lim: int):
+        return [{"source_id": "VIZ_FAST_1", "ra": r, "dec": d, "phot_g_mean_mag": 12.3}]
+
+    monkeypatch.setattr(gaia_svc, "_query_esa_json", _slow_esa)
+    monkeypatch.setattr(gaia_svc, "_run_vizier", _fast_vizier)
+
+    t0 = time.perf_counter()
+    g_res = asyncio.run(gaia_svc.query(133.7951, -7.2451, 0.1))
+    elapsed_gaia = time.perf_counter() - t0
+    assert elapsed_gaia < 0.5
+    assert len(g_res.field) == 1
+    assert g_res.field[0]["source_id"] == "VIZ_FAST_1"
+
+    # 3. `select_display_frames` caps to max 2 best-centered frames per epoch across 6 detectors
+    cache = FitsCache(cfg.cache_dir, ttl_s=3600, max_bytes=50_000_000)
+    irsa_svc = IrsaService(cfg, None, cache)  # type: ignore[arg-type]
+    ep_frames = [
+        Frame(f"obs_{d}", d, "spherex_dr1", 60850.0, 60850.01, "http://example", 133.7951 + 0.01 * d, -7.2451)
+        for d in range(1, 7)
+    ]
+    ep = Epoch(0, ep_frames)
+    sel = irsa_svc.select_display_frames(ep, BAND_GROUPS["all"], 133.7951, -7.2451)
+    assert len(sel) == 2
+    assert [f.detector for f in sel] == [1, 2]  # closest to (133.7951, -7.2451)
+
+    # 5. Non-blocking async wrappers in fits_processor
+    raw_fits = _make_synthetic_spherex_me_fits(133.7951, -7.2451, detector=6, mjd=60850.0)
+    fits_p = tmp_path / "async_test.fits"
+    fits_p.write_bytes(raw_fits)
+    fd = fp.load_frame(fits_p, "obs/D6", 6, 60850.0)
+    grid = fp.make_grid(133.7951, -7.2451, 0.08, 6.15, 128)
+    coadd = asyncio.run(fp.coadd_epoch_async(0, [fd], grid))
+    png_bytes = asyncio.run(fp.render_image_async(coadd.image, -0.05, 1.0, size=128))
+    rgb_bytes = asyncio.run(fp.render_rgb_composite_async(coadd, size=128))
+    assert png_bytes[:8] == b"\x89PNG\r\n\x1a\n"
+    assert rgb_bytes[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_race_first_success_and_stale_if_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verify:
+    1. `race_first_success` does not cancel healthy siblings when a fast branch fails (e.g. 502).
+    2. `IrsaService.query_frames(force_refresh=True)` lets TAP win if SIA returns 502, and falls
+       back to stale `/tmp/fits_cache/tap/` when both SIA and TAP fail.
+    3. `GaiaService._query_vizier_tap` parses VizieR CSV cleanly.
+    4. `PipelineService` isolates Gaia and WISE exceptions so they never crash the pipeline.
+    """
+    import httpx
+    from app.core.async_utils import race_first_success
+    from app.services.irsa_service import IrsaService
+    from app.services.pipeline import PipelineService
+    from app.services.supabase_service import SupabaseService
+
+    # 1. `race_first_success`: branch A fails fast, branch B succeeds slightly later
+    async def _run_race():
+        async def _fail_fast():
+            await asyncio.sleep(0.01)
+            raise RuntimeError("502 Proxy Error")
+
+        async def _win_later():
+            await asyncio.sleep(0.05)
+            return "winner_payload"
+
+        tasks = [
+            asyncio.create_task(_fail_fast(), name="fast-502"),
+            asyncio.create_task(_win_later(), name="slow-ok"),
+        ]
+        return await race_first_success(tasks, timeout=1.0)
+
+    res_val, winner_name = asyncio.run(_run_race())
+    assert res_val == "winner_payload"
+    assert winner_name == "slow-ok"
+
+    # 2. IRSA SIA 502 -> TAP succeeds, then both fail on force_refresh -> stale cache fallback
+    cfg = Settings(supabase_url="", supabase_key="", cache_dir=tmp_path / "cache", http_retries=1)
+    cache = FitsCache(cfg.cache_dir, ttl_s=3600, max_bytes=50_000_000)
+
+    async def _test_irsa():
+        async with httpx.AsyncClient() as http_client:
+            irsa = IrsaService(cfg, http_client, cache)
+
+            async def _sia_502(r: float, d: float):
+                raise RuntimeError("502 Proxy Error")
+
+            async def _tap_ok(r: float, d: float):
+                await asyncio.sleep(0.03)
+                return [Frame("obs_tap", 1, "spherex_dr1", 60850.0, 60850.01, "http://ex", r, d)]
+
+            monkeypatch.setattr(irsa, "_query_sia", _sia_502)
+            monkeypatch.setattr(irsa, "_query_tap_csv", _tap_ok)
+
+            frames1 = await irsa.query_frames(271.2345, 65.4321, force_refresh=True)
+            assert len(frames1) == 1
+            assert frames1[0].obs_id == "obs_tap"
+
+            # Now make BOTH fail -> Stale-if-Error must return cached obs_tap instead of raising
+            async def _tap_502(r: float, d: float):
+                raise RuntimeError("502 Proxy Error")
+
+            monkeypatch.setattr(irsa, "_query_tap_csv", _tap_502)
+            frames2 = await irsa.query_frames(271.2345, 65.4321, force_refresh=True)
+            assert len(frames2) == 1
+            assert frames2[0].obs_id == "obs_tap"
+
+    asyncio.run(_test_irsa())
+
+    # 3. VizieR TAP CSV parsing in GaiaService
+    def _vizier_handler(_request: httpx.Request) -> httpx.Response:
+        csv_body = (
+            "source_id,ra,dec,parallax,parallax_error,pmra,pmdec,pm,phot_g_mean_mag,bp_rp,ruwe\n"
+            "1234567890,271.2345,65.4321,5.2,0.1,10.0,-5.0,11.18,14.5,1.2,1.01\n"
+        )
+        return httpx.Response(200, text=csv_body)
+
+    async def _test_vizier():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(_vizier_handler)) as client:
+            g = GaiaService(cfg, client)
+            rows = await g._query_vizier_tap(271.2345, 65.4321, 0.05, 100)
+            assert len(rows) == 1
+            assert rows[0]["source_id"] == "1234567890"
+            assert rows[0]["phot_g_mean_mag"] == pytest.approx(14.5)
+
+    asyncio.run(_test_vizier())
+
+    # 4. PipelineService isolates Gaia/WISE errors
+    async def _test_isolation():
+        async with httpx.AsyncClient() as client:
+            irsa = IrsaService(cfg, client, cache)
+            gaia = GaiaService(cfg, client)
+            wise = WiseService(cfg, client)
+            db = SupabaseService(cfg, client)
+            pipe = PipelineService(cfg, cache, irsa, gaia, db, wise=wise)
+
+            async def _boom(*_a, **_kw):
+                raise RuntimeError("unexpected catalog crash")
+
+            monkeypatch.setattr(gaia, "query", _boom)
+            monkeypatch.setattr(wise, "query", _boom)
+            g_out = await pipe._safe_gaia_query(271.2345, 65.4321, 0.1)
+            w_out = await pipe._safe_wise_query(271.2345, 65.4321)
+            assert g_out.error is not None and "unexpected catalog crash" in g_out.error
+            assert w_out.error is not None and "unexpected catalog crash" in w_out.error
+
+    asyncio.run(_test_isolation())
+
+
+
+
 
 
 

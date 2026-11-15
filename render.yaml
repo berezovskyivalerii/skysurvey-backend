@@ -16,4 +16,4 @@ services:
       - key: SUPABASE_KEY
         sync: false
       - key: SUPABASE_BUCKET
-        value: skysurvey-cache
+        value: skysurvey

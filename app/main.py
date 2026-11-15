@@ -87,6 +87,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["*"],
     )
 
     local_storage = cfg.cache_dir / "storage"
@@ -94,6 +95,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.mount("/static/storage", StaticFiles(directory=str(local_storage)), name="static-storage")
 
     app.include_router(targets_router)
+
+    @app.get("/", tags=["system"])
+    async def root():
+        return {
+            "service": cfg.app_name,
+            "status": "ok",
+            "version": cfg.pipeline_version,
+            "docs": "/docs",
+            "health": "/health",
+            "presets": "/api/v1/presets",
+            "target": "/api/v1/target?ra=269.4485&dec=4.7394&fov=0.1",
+        }
 
     @app.get("/health", tags=["system"])
     async def health():

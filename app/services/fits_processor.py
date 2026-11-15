@@ -21,6 +21,7 @@ Design decisions
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import io
@@ -311,7 +312,7 @@ def _to_png(arr_u8: np.ndarray, size: int, resample: str, mode: str) -> bytes:
     if size and im.size != (size, size):
         im = im.resize((size, size), _RESAMPLE.get(resample, Image.NEAREST))
     buf = io.BytesIO()
-    im.save(buf, format="PNG", compress_level=6)
+    im.save(buf, format="PNG", compress_level=1)
     return buf.getvalue()
 
 
@@ -815,3 +816,42 @@ def bin_spectrum(samples: list[SpectralSample]) -> list[SpectrumPoint]:
             )
         )
     return points
+
+
+# ========================================== non-blocking async wrappers ==
+async def reproject_frame_async(fd: FrameData, grid: DisplayGrid) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run `reproject_interp` in a worker thread without blocking the event loop."""
+    return await asyncio.to_thread(reproject_frame, fd, grid)
+
+
+async def coadd_epoch_async(index: int, frames: list[FrameData], grid: DisplayGrid) -> EpochCoadd:
+    """Run WCS reprojection (`reproject_interp`) and inverse-variance co-adding via `asyncio.to_thread`."""
+    return await asyncio.to_thread(coadd_epoch, index, frames, grid)
+
+
+async def render_image_async(
+    data: np.ndarray,
+    vmin: float,
+    vmax: float,
+    stretch_type: str = "asinh",
+    size: int = 512,
+    resample: str = "nearest",
+    asinh_a: float = 0.1,
+    log_a: float = 1000.0,
+) -> bytes:
+    """Render stretched grayscale PNG in a worker thread via `asyncio.to_thread`."""
+    return await asyncio.to_thread(
+        render_image, data, vmin, vmax, stretch_type, size, resample, asinh_a, log_a
+    )
+
+
+async def render_rgb_composite_async(
+    c: EpochCoadd,
+    size: int = 512,
+    resample: str = "nearest",
+    asinh_q: float = 6.0,
+    max_snr: float = 25.0,
+) -> bytes:
+    """Render false-color RGB PNG in a worker thread via `asyncio.to_thread`."""
+    return await asyncio.to_thread(render_rgb_composite, c, size, resample, asinh_q, max_snr)
+

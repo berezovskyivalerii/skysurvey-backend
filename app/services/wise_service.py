@@ -8,6 +8,7 @@ diagnostics.
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
@@ -162,8 +163,10 @@ class WiseService:
             sources = self._parse_catwise_rows(raw_rows)
             log.info("CatWISE2020 returned %d sources in %.2fs", len(sources), time.perf_counter() - t0)
             return WiseResult(sources=sources, catalog="CatWISE2020", epoch_mjd=CATWISE_EPOCH_MJD)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            log.warning("CatWISE2020 query failed (%s); falling back to %s", exc, self.s.allwise_table)
+            log.warning("CatWISE2020 query failed (%r); falling back to %s", exc, self.s.allwise_table)
             allwise_adql = f"""
                 SELECT designation AS source_id, ra, dec, w1mpro, w2mpro, w1snr, w2snr
                 FROM {self.s.allwise_table}
@@ -174,8 +177,10 @@ class WiseService:
                 sources = self._parse_allwise_rows(raw_rows)
                 log.info("AllWISE fallback returned %d sources in %.2fs", len(sources), time.perf_counter() - t0)
                 return WiseResult(sources=sources, catalog="AllWISE", epoch_mjd=ALLWISE_EPOCH_MJD)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc2:
-                log.warning("AllWISE fallback failed (%s); trying VizieR CatWISE2020 mirror", exc2)
+                log.warning("AllWISE fallback failed (%r); trying VizieR CatWISE2020 mirror", exc2)
                 vizier_adql = f"""
                     SELECT objID AS source_id, RAdeg AS ra, DEdeg AS dec,
                            pmRA AS pmra, pmDE AS pmdec,
@@ -191,9 +196,11 @@ class WiseService:
                     sources = self._parse_catwise_rows(raw_rows)
                     log.info("VizieR CatWISE2020 mirror returned %d sources in %.2fs", len(sources), time.perf_counter() - t0)
                     return WiseResult(sources=sources, catalog="CatWISE2020", epoch_mjd=CATWISE_EPOCH_MJD)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc3:
-                    log.warning("VizieR CatWISE2020 fallback also failed: %s", exc3)
-                    return WiseResult(sources=[], catalog="CatWISE2020", epoch_mjd=CATWISE_EPOCH_MJD, error=str(exc2))
+                    log.warning("VizieR CatWISE2020 fallback also failed: %r", exc3)
+                    return WiseResult(sources=[], catalog="CatWISE2020", epoch_mjd=CATWISE_EPOCH_MJD, error=repr(exc2))
 
     def best_match(
         self,

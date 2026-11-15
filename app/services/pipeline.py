@@ -59,6 +59,7 @@ class PipelineService:
         self.wise = wise or WiseService(settings, irsa.http)
         self.solar_system = solar_system or SolarSystemService(settings, irsa.http)
         self._inflight: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        self._pending_sync: dict[str, tuple[dict[str, Any], list[tuple[str, bytes, str]], list[Frame]]] = {}
         self._bg_tasks: set[asyncio.Task[Any]] = set()
 
     # ===================================================== public entrypoint ==
@@ -70,6 +71,8 @@ class PipelineService:
         band: BandName = "all",
         sync: bool = True,
         force_refresh: bool = False,
+        fast: bool = True,
+        background_tasks: Any | None = None,
     ) -> TargetResponse:
         ra_n, dec_n, fov_n = normalize_ra(ra), normalize_dec(dec), normalize_fov(fov)
         key = target_key(ra_n, dec_n, fov_n, band)
@@ -81,7 +84,7 @@ class PipelineService:
                 if status in ("ready", "partial", "no_data"):
                     stale = self._is_stale(cached)
                     if stale and key not in self._inflight:
-                        self._spawn_pipeline(ra_n, dec_n, fov_n, band, key)
+                        self._spawn_pipeline(ra_n, dec_n, fov_n, band, key, fast=fast)
                     return self._row_to_response(cached, hit=True, stale=stale)
                 if status == "processing" and not self._is_lock_expired(cached):
                     if not sync:
@@ -89,12 +92,13 @@ class PipelineService:
                     task = self._inflight.get(key)
                     if task:
                         row = await asyncio.wait_for(asyncio.shield(task), timeout=self.s.sync_timeout_s)
+                        self._schedule_cloud_sync(key, background_tasks)
                         return self._row_to_response(row, hit=False, stale=False)
 
         # Cache miss (or forced refresh)
         task = self._inflight.get(key)
         if task is None:
-            task = self._spawn_pipeline(ra_n, dec_n, fov_n, band, key)
+            task = self._spawn_pipeline(ra_n, dec_n, fov_n, band, key, fast=fast, force_refresh=force_refresh)
 
         if not sync:
             # Give the task a brief moment to write the initial 'processing' row
@@ -104,7 +108,29 @@ class PipelineService:
                 return self._row_to_response(cached, hit=False, stale=False)
 
         row = await asyncio.wait_for(asyncio.shield(task), timeout=self.s.sync_timeout_s)
+        self._schedule_cloud_sync(key, background_tasks)
         return self._row_to_response(row, hit=False, stale=False)
+
+    def _schedule_cloud_sync(self, key: str, background_tasks: Any | None) -> None:
+        sync_item = self._pending_sync.pop(key, None)
+        if sync_item is None:
+            return
+        sync_row, sync_uploads, sync_frames = sync_item
+        if background_tasks is not None and hasattr(background_tasks, "add_task"):
+            background_tasks.add_task(
+                self.db.sync_target_to_cloud,
+                key,
+                sync_row,
+                sync_uploads,
+                sync_frames,
+            )
+        else:
+            bg = asyncio.create_task(
+                self.db.sync_target_to_cloud(key, sync_row, sync_uploads, sync_frames),
+                name=f"cloud-sync:{key}",
+            )
+            self._bg_tasks.add(bg)
+            bg.add_done_callback(self._bg_tasks.discard)
 
     # ========================================================== restretch ====
     async def restretch(self, req: RestretchRequest) -> RestretchResponse:
@@ -191,15 +217,50 @@ class PipelineService:
 
     # ==================================================== internal pipeline ==
     def _spawn_pipeline(
-        self, ra: float, dec: float, fov: float, band: BandName, key: str
+        self,
+        ra: float,
+        dec: float,
+        fov: float,
+        band: BandName,
+        key: str,
+        fast: bool = True,
+        force_refresh: bool = False,
     ) -> asyncio.Task[dict[str, Any]]:
-        task = asyncio.create_task(self._run_pipeline(ra, dec, fov, band, key), name=f"pipeline:{key}")
+        task = asyncio.create_task(
+            self._run_pipeline(ra, dec, fov, band, key, fast=fast, force_refresh=force_refresh),
+            name=f"pipeline:{key}",
+        )
         self._inflight[key] = task
         task.add_done_callback(lambda _: self._inflight.pop(key, None))
         return task
 
+    async def _safe_gaia_query(self, ra: float, dec: float, fov: float) -> GaiaResult:
+        try:
+            return await self.gaia.query(ra, dec, fov)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Isolated Gaia error for (%.4f, %+.4f): %r", ra, dec, exc)
+            return GaiaResult([], [], error=f"Gaia unavailable: {exc!r}")
+
+    async def _safe_wise_query(self, ra: float, dec: float) -> WiseResult:
+        try:
+            return await self.wise.query(ra, dec)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Isolated WISE error for (%.4f, %+.4f): %r", ra, dec, exc)
+            return WiseResult(sources=[], error=repr(exc))
+
     async def _run_pipeline(
-        self, ra: float, dec: float, fov: float, band: BandName, key: str
+        self,
+        ra: float,
+        dec: float,
+        fov: float,
+        band: BandName,
+        key: str,
+        fast: bool = True,
+        force_refresh: bool = False,
     ) -> dict[str, Any]:
         t0 = time.perf_counter()
         base_row: dict[str, Any] = {
@@ -216,30 +277,41 @@ class PipelineService:
             "epochs": [],
             "error": None,
         }
-        await self.db.upsert_target(base_row)
+        self.db.upsert_target_local(base_row)
 
         try:
-            # Step 3 & 4a in parallel: IRSA TAP ObsCore + Gaia DR3 + CatWISE2020 cone searches
+            # Step 3 & 4a in parallel: IRSA TAP/SIA + Gaia DR3 + CatWISE2020 (catalog errors isolated)
+            try:
+                irsa_frames = self.irsa.query_frames(ra, dec, force_refresh=force_refresh)
+            except TypeError:
+                # Backwards compatibility for test fakes with signature (ra, dec)
+                irsa_frames = self.irsa.query_frames(ra, dec)
+
             frames, gaia_res, wise_res = await asyncio.gather(
-                self.irsa.query_frames(ra, dec),
-                self.gaia.query(ra, dec, fov),
-                self.wise.query(ra, dec),
+                irsa_frames,
+                self._safe_gaia_query(ra, dec, fov),
+                self._safe_wise_query(ra, dec),
             )
             if not frames:
-                grid = fp.make_grid(ra, dec, fov, self.s.spherex_pixel_scale_arcsec, self.s.png_size)
-                mjd_ref = 61000.0
-                gmatch = self.gaia.best_match(gaia_res, ra, dec, mjd_ref)
-                xmatch = self.gaia.classify(gmatch, None, gaia_res.error)
-                xmatch.wise_match = self.wise.best_match(wise_res, ra, dec, mjd_ref)
-                xmatch.overlay = self.gaia.overlay(gaia_res, mjd_ref, grid.world_to_png)
-                no_data_row = {
-                    **base_row,
-                    "status": "no_data",
-                    "classification": xmatch.classification,
-                    "progress": {"stage": "No SPHEREx coverage", "percent": 100},
-                    "crossmatch": xmatch.model_dump(mode="json"),
-                }
-                return await self.db.upsert_target(no_data_row)
+                def _build_no_data() -> dict[str, Any]:
+                    grid = fp.make_grid(ra, dec, fov, self.s.spherex_pixel_scale_arcsec, self.s.png_size)
+                    mjd_ref = 61000.0
+                    gmatch = self.gaia.best_match(gaia_res, ra, dec, mjd_ref)
+                    xmatch = self.gaia.classify(gmatch, None, gaia_res.error)
+                    xmatch.wise_match = self.wise.best_match(wise_res, ra, dec, mjd_ref)
+                    xmatch.overlay = self.gaia.overlay(gaia_res, mjd_ref, grid.world_to_png)
+                    return {
+                        **base_row,
+                        "status": "no_data",
+                        "classification": xmatch.classification,
+                        "progress": {"stage": "No SPHEREx coverage", "percent": 100},
+                        "crossmatch": xmatch.model_dump(mode="json"),
+                    }
+
+                no_data_row = await asyncio.to_thread(_build_no_data)
+                saved = self.db.upsert_target_local(no_data_row)
+                self._pending_sync[key] = (saved, [], [])
+                return saved
 
             epochs = self.irsa.group_epochs(frames)
             detectors = BAND_GROUPS.get(band, BAND_GROUPS["all"])
@@ -251,7 +323,7 @@ class PipelineService:
                     display_by_epoch.append((ep, sel))
                     display_frames.extend(sel)
 
-            await self.db.upsert_target(
+            self.db.upsert_target_local(
                 {
                     **base_row,
                     "n_observations": len(frames),
@@ -262,14 +334,13 @@ class PipelineService:
             # Resolve Datalink URLs (using DB cache first)
             known_urls = await self.db.get_cached_fits_urls([f.key for f in display_frames])
             await self.irsa.resolve_fits_urls(display_frames, known_urls)
-            await self.db.save_observations(display_frames)
 
             # Download cutouts (padded by 20% so rotated detector edges cover corners)
             cutout_deg = min(fov * 1.25, 0.5)
             downloaded = await self.irsa.fetch_many(display_frames, ra, dec, cutout_deg)
             path_by_key: dict[str, Path] = {f.key: p for f, p in downloaded}
 
-            await self.db.upsert_target(
+            self.db.upsert_target_local(
                 {
                     **base_row,
                     "n_observations": len(frames),
@@ -277,7 +348,7 @@ class PipelineService:
                 }
             )
 
-            # CPU step in thread pool: load frames, WCS reproject, co-add, render PNGs, extract spectrum
+            # CPU step in thread pool: load frames, WCS reproject, co-add, render PNGs, extract fast spectrum
             cpu_res = await asyncio.to_thread(
                 self._process_display_cpu,
                 ra,
@@ -288,12 +359,14 @@ class PipelineService:
                 path_by_key,
                 gaia_res,
                 wise_res,
+                fast,
             )
 
-            # Upload all epoch PNGs + co-add FITS to Supabase Storage and query SkyBoT concurrently
+            # Save PNGs + co-add FITS locally to /tmp/fits_cache/storage (/static/storage/...)
+            # and query SkyBoT concurrently (Supabase upload is deferred to BackgroundTasks)
             epoch_mjds = [ep_info["coadd"].mjd_mid for ep_info in cpu_res["epochs_info"]]
             url_map, minor_planets_by_epoch = await asyncio.gather(
-                self.db.upload_many(cpu_res["uploads"]),
+                self.db.save_local_many(cpu_res["uploads"]),
                 self.solar_system.query_epochs(ra, dec, fov, epoch_mjds, cpu_res["grid"].world_to_png),
             )
 
@@ -337,7 +410,7 @@ class PipelineService:
                 )
 
             used_keys = set(path_by_key.keys())
-            extra_spec_frames = self.irsa.select_spectrum_frames(epochs, used_keys)
+            extra_spec_frames = [] if fast else self.irsa.select_spectrum_frames(epochs, used_keys)
             has_phase2 = len(extra_spec_frames) > 0
 
             spectrum_obj = Spectrum(
@@ -349,7 +422,7 @@ class PipelineService:
             xmatch: Any = cpu_res["crossmatch"]
             display_info: DisplayInfo = cpu_res["display"]
 
-            row = await self.db.upsert_target(
+            row = self.db.upsert_target_local(
                 {
                     "target_key": key,
                     "ra": ra,
@@ -374,6 +447,7 @@ class PipelineService:
                     "error": None,
                 }
             )
+            self._pending_sync[key] = (row, cpu_res["uploads"], display_frames)
             log.info(
                 "Target %s phase-1 ready in %.2fs (%d epochs, %d frames, status=%s)",
                 key,
@@ -409,7 +483,7 @@ class PipelineService:
                 "progress": {"stage": "Failed", "percent": 100},
                 "error": str(e),
             }
-            return await self.db.upsert_target(failed_row)
+            return self.db.upsert_target_local(failed_row)
 
     def _process_display_cpu(
         self,
@@ -421,6 +495,7 @@ class PipelineService:
         path_by_key: dict[str, Path],
         gaia_res: GaiaResult,
         wise_res: WiseResult | None = None,
+        fast: bool = True,
     ) -> dict[str, Any]:
         grid = fp.make_grid(ra, dec, fov, self.s.spherex_pixel_scale_arcsec, self.s.png_size)
         coadds: list[fp.EpochCoadd] = []
@@ -547,10 +622,12 @@ class PipelineService:
         samples = [s for fd in all_loaded if (s := fp.extract_sample(fd, phot_ra, phot_dec)) is not None]
         points = fp.bin_spectrum(samples)
 
-        # Combine explicitly downloaded paths with any other cached cutouts covering (phot_ra, phot_dec)
+        # Fast spectrum on Cold Start: compute only from already-downloaded cutouts;
+        # full directory scan / extra detector downloads are reserved for /target/spectrum or fast=False
         fits_set = {p for p in path_by_key.values() if p is not None}
-        for cov_p in find_covering_fits(self.cache.root / "raw", phot_ra, phot_dec):
-            fits_set.add(cov_p)
+        if not fast:
+            for cov_p in find_covering_fits(self.cache.root / "raw", phot_ra, phot_dec):
+                fits_set.add(cov_p)
         spectrum_data = extract_spectrum(
             sorted(fits_set),
             phot_ra,
@@ -830,7 +907,7 @@ class PipelineService:
         # Step 2: Check local FITS files in /tmp/fits_cache/raw/
         local_files = await asyncio.to_thread(find_covering_fits, self.cache.root / "raw", ra_n, dec_n)
 
-        # Step 3: If no local files (or force_refresh), download cutouts from IRSA
+        # Step 3: If no local files (or force_refresh), download cutouts across all 6 detectors from IRSA
         if not local_files or force_refresh:
             try:
                 frames = await self.irsa.query_frames(ra_n, dec_n)
@@ -838,7 +915,9 @@ class PipelineService:
                     epochs = self.irsa.group_epochs(frames)
                     selected: list[Frame] = []
                     for ep in epochs:
-                        selected.extend(self.irsa.select_display_frames(ep, BAND_GROUPS["all"], ra_n, dec_n))
+                        selected.extend(
+                            self.irsa.select_display_frames(ep, BAND_GROUPS["all"], ra_n, dec_n, max_per_epoch=6)
+                        )
                     known = await self.db.get_cached_fits_urls([f.key for f in selected])
                     await self.irsa.resolve_fits_urls(selected, known)
                     await self.db.save_observations(selected)

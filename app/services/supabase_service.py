@@ -91,6 +91,17 @@ class SupabaseService:
         """Look up target by exact canonical `target_key`, falling back to the
         spherical-tolerance RPC `find_target` within `coord_match_tol_arcsec`."""
         key = target_key(ra, dec, fov, band)
+        # Fast L1 in-process hit (includes targets whose BackgroundTasks cloud sync is still in flight)
+        if key in self._mem_targets:
+            return dict(self._mem_targets[key])
+        for row in self._mem_targets.values():
+            if (
+                row.get("band") == band
+                and abs(float(row.get("fov", 0)) - fov) < 5e-4
+                and ang_sep_arcsec(float(row["ra"]), float(row["dec"]), ra, dec) <= self.s.coord_match_tol_arcsec
+            ):
+                return dict(row)
+
         client = await self._get_client()
         if client is not None:
             try:
@@ -104,6 +115,7 @@ class SupabaseService:
                 if res and getattr(res, "data", None):
                     rows = res.data
                     if isinstance(rows, list) and rows:
+                        self._mem_targets[key] = dict(rows[0])
                         return dict(rows[0])
                 # Tolerance search via RPC
                 rpc = await client.rpc(
@@ -119,27 +131,30 @@ class SupabaseService:
                 if rpc and getattr(rpc, "data", None):
                     rows = rpc.data
                     if isinstance(rows, list) and rows:
+                        self._mem_targets[rows[0].get("target_key", key)] = dict(rows[0])
                         return dict(rows[0])
                 # Supabase query succeeded and returned 0 rows -> true cache miss
                 return None
             except Exception as e:
                 log.warning("Supabase get_target(%s) failed, using fallback: %s", key, e)
 
-        # In-memory fallback (used only when Supabase is disabled or unreachable)
-        if key in self._mem_targets:
-            return dict(self._mem_targets[key])
-        for row in self._mem_targets.values():
-            if (
-                row.get("band") == band
-                and abs(float(row.get("fov", 0)) - fov) < 5e-4
-                and ang_sep_arcsec(float(row["ra"]), float(row["dec"]), ra, dec) <= self.s.coord_match_tol_arcsec
-            ):
-                return dict(row)
         return None
 
     async def get_target_by_coords(self, ra: float, dec: float) -> dict[str, Any] | None:
         """Find any cached target within `coord_match_tol_arcsec` of (ra, dec) that has `spectrum_data`."""
         ra_n, dec_n = normalize_ra(ra), normalize_dec(dec)
+        best_row: dict[str, Any] | None = None
+        best_sep = 1e9
+        tol = max(self.s.coord_match_tol_arcsec, 3.0)
+        for row in self._mem_targets.values():
+            if not row.get("spectrum_data"):
+                continue
+            sep = ang_sep_arcsec(float(row["ra"]), float(row["dec"]), ra_n, dec_n)
+            if sep <= tol and sep < best_sep:
+                best_row, best_sep = row, sep
+        if best_row is not None:
+            return dict(best_row)
+
         client = await self._get_client()
         if client is not None:
             try:
@@ -148,7 +163,7 @@ class SupabaseService:
                     {
                         "p_ra": ra_n,
                         "p_dec": dec_n,
-                        "p_tol_arcsec": max(self.s.coord_match_tol_arcsec, 3.0),
+                        "p_tol_arcsec": tol,
                     },
                 ).execute()
                 if rpc and getattr(rpc, "data", None):
@@ -159,19 +174,10 @@ class SupabaseService:
             except Exception as e:
                 log.debug("Supabase find_target_by_coords failed: %s", e)
 
-        best_row: dict[str, Any] | None = None
-        best_sep = 1e9
-        tol = max(self.s.coord_match_tol_arcsec, 3.0)
-        for row in self._mem_targets.values():
-            if not row.get("spectrum_data"):
-                continue
-            sep = ang_sep_arcsec(float(row["ra"]), float(row["dec"]), ra_n, dec_n)
-            if sep <= tol and sep < best_sep:
-                best_row, best_sep = row, sep
-        return dict(best_row) if best_row else None
+        return None
 
-    async def upsert_target(self, record: dict[str, Any]) -> dict[str, Any]:
-        """Insert or update a row in `targets` keyed by `target_key`."""
+    def upsert_target_local(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Update in-memory and local-disk target cache immediately without waiting for Supabase network I/O."""
         now_iso = datetime.now(timezone.utc).isoformat()
         key = record["target_key"]
         existing = self._mem_targets.get(key, {})
@@ -183,6 +189,12 @@ class SupabaseService:
         }
         self._mem_targets[key] = merged
         self._save_local_db()
+        return merged
+
+    async def upsert_target(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Insert or update a row in `targets` keyed by `target_key`."""
+        merged = self.upsert_target_local(record)
+        key = record["target_key"]
 
         client = await self._get_client()
         if client is not None:
@@ -263,12 +275,64 @@ class SupabaseService:
                 log.debug("Supabase save_observations failed: %s", e)
 
     # ===================================================== storage bucket ===
+    def _local_public_url(self, clean: str) -> str:
+        import os
+
+        base = (self.s.public_base_url or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
+        return f"{base}/static/storage/{clean}?v={self.s.pipeline_version}"
+
+    def local_url(self, storage_path: str) -> str:
+        return self._local_public_url(storage_path.lstrip("/"))
+
     def public_url(self, storage_path: str) -> str:
         clean = storage_path.lstrip("/")
         if self.enabled:
             base = self.s.supabase_url.rstrip("/")
             return f"{base}/storage/v1/object/public/{self.s.supabase_bucket}/{clean}?v={self.s.pipeline_version}"
-        return f"/static/storage/{clean}?v={self.s.pipeline_version}"
+        return self._local_public_url(clean)
+
+    async def save_local_many(
+        self, items: list[tuple[str, bytes, str]]
+    ) -> dict[str, str]:
+        """Write all PNG layers and co-add FITS files locally to `/tmp/fits_cache/storage`
+        via `asyncio.to_thread` and immediately return `/static/storage/...` URLs."""
+        def _write_batch() -> dict[str, str]:
+            out: dict[str, str] = {}
+            for path, data, _ctype in items:
+                clean = path.lstrip("/")
+                dest = self.local_storage_dir / clean
+                self._write_local(dest, data)
+                out[path] = self._local_public_url(clean)
+            return out
+
+        return await asyncio.to_thread(_write_batch)
+
+    async def sync_target_to_cloud(
+        self,
+        key: str,
+        row: dict[str, Any],
+        uploads: list[tuple[str, bytes, str]],
+        frames: list[Any] | None = None,
+    ) -> None:
+        """Background task (`fastapi.BackgroundTasks`): upload PNGs/FITS to Supabase
+        Storage and upsert `observations` + `targets` into Supabase PostgreSQL."""
+        try:
+            if frames:
+                await self.save_observations(frames)
+            if not self.enabled:
+                return
+            cloud_row = dict(row)
+            if uploads:
+                await self.upload_many(uploads)
+                # Replace ephemeral /static/storage/ URLs with durable Supabase CDN URLs in DB
+                local_prefix = self._local_public_url("").split("?")[0]
+                cloud_prefix = f"{self.s.supabase_url.rstrip('/')}/storage/v1/object/public/{self.s.supabase_bucket}/"
+                raw_json = json.dumps(cloud_row, default=str).replace(local_prefix, cloud_prefix)
+                cloud_row = json.loads(raw_json)
+            await self.upsert_target(cloud_row)
+            log.info("Background Supabase sync completed for %s (%d files)", key, len(uploads))
+        except Exception as e:
+            log.warning("Background Supabase sync failed for %s: %s", key, e)
 
     async def upload_bytes(
         self, storage_path: str, data: bytes, content_type: str = "image/png"
@@ -297,7 +361,7 @@ class SupabaseService:
                 log.warning("Supabase Storage upload failed for %s (%s), saving locally", clean, e)
                 dest = self.local_storage_dir / clean
                 await asyncio.to_thread(self._write_local, dest, data)
-                return f"/static/storage/{clean}?v={self.s.pipeline_version}"
+                return self._local_public_url(clean)
 
     async def upload_many(
         self, items: list[tuple[str, bytes, str]]
@@ -312,7 +376,7 @@ class SupabaseService:
     async def download_storage_bytes(self, url_or_path: str) -> bytes | None:
         """Download an object back from Storage (used when `/tmp/fits_cache` was
         evicted or the container restarted before `/restretch`)."""
-        if url_or_path.startswith("/static/storage/"):
+        if "/static/storage/" in url_or_path:
             rel = url_or_path.split("/static/storage/", 1)[1].split("?", 1)[0]
             p = self.local_storage_dir / rel
             return p.read_bytes() if p.is_file() else None

@@ -959,7 +959,20 @@ class PipelineService:
         """
         ra_n, dec_n = normalize_ra(ra), normalize_dec(dec)
 
+        # If GET /api/v1/target is ALREADY in flight for these coordinates (e.g. frontend fired
+        # /target and /target/spectrum concurrently in Promise.all / useEffect), coalesce onto
+        # the in-flight pipeline task instead of launching a competing 24-frame IRSA download!
         if not force_refresh:
+            coord_prefix = f"{ra_n:.4f}_{dec_n:+.4f}_"
+            inflight_task = next(
+                (t for k, t in self._inflight.items() if k.startswith(coord_prefix)),
+                None,
+            )
+            if inflight_task is not None:
+                row = await asyncio.wait_for(asyncio.shield(inflight_task), timeout=self.s.sync_timeout_s)
+                if row and row.get("spectrum_data"):
+                    return SpectrumResponse.model_validate(row["spectrum_data"])
+
             cached = await self.db.get_target_by_coords(ra_n, dec_n)
             if cached and cached.get("spectrum_data"):
                 return SpectrumResponse.model_validate(cached["spectrum_data"])
@@ -967,22 +980,29 @@ class PipelineService:
         # Step 2: Check local FITS files in /tmp/fits_cache/raw/
         local_files = await asyncio.to_thread(find_covering_fits, self.cache.root / "raw", ra_n, dec_n)
 
-        # Step 3: If no local files (or force_refresh), download cutouts across all 6 detectors from IRSA
+        # Step 3: If no local files (or force_refresh), download cutouts from IRSA
         if not local_files or force_refresh:
             try:
                 frames = await self.irsa.query_frames(ra_n, dec_n)
                 if frames:
                     epochs = self.irsa.group_epochs(frames)
                     selected: list[Frame] = []
-                    for ep in epochs:
+                    for ep in epochs[-2:]:
                         selected.extend(
-                            self.irsa.select_display_frames(ep, BAND_GROUPS["all"], ra_n, dec_n, max_per_epoch=6)
+                            self.irsa.select_display_frames(ep, BAND_GROUPS["all"], ra_n, dec_n, max_per_epoch=2)
                         )
                     known = await self.db.get_cached_fits_urls([f.key for f in selected])
-                    await self.irsa.resolve_fits_urls(selected, known)
-                    await self.db.save_observations(selected)
                     cutout_deg = max(self.s.spectrum_cutout_arcsec / 3600.0, min(fov * 1.1, 0.15))
-                    downloaded = await self.irsa.fetch_many(selected, ra_n, dec_n, cutout_deg)
+                    if (
+                        hasattr(self.irsa, "resolve_and_fetch_many")
+                        and getattr(self.irsa.fetch_many, "__func__", None) is IrsaService.fetch_many
+                    ):
+                        downloaded = await self.irsa.resolve_and_fetch_many(
+                            selected, known, ra_n, dec_n, cutout_deg
+                        )
+                    else:
+                        await self.irsa.resolve_fits_urls(selected, known)
+                        downloaded = await self.irsa.fetch_many(selected, ra_n, dec_n, cutout_deg)
                     local_files = [p for _, p in downloaded]
                     # Also include any additional covering files present in raw/
                     extra_cov = await asyncio.to_thread(find_covering_fits, self.cache.root / "raw", ra_n, dec_n)

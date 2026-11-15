@@ -46,8 +46,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             max_connections=cfg.http_max_connections,
             max_keepalive_connections=cfg.http_max_connections // 2,
         )
-        timeout = httpx.Timeout(cfg.http_timeout_s, connect=15.0)
-        async with httpx.AsyncClient(limits=limits, timeout=timeout, follow_redirects=True) as http:
+        timeout = httpx.Timeout(cfg.http_timeout_s, connect=10.0)
+        transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0", limits=limits)
+        async with httpx.AsyncClient(
+            transport=transport,
+            limits=limits,
+            timeout=timeout,
+            follow_redirects=True,
+        ) as http:
             irsa = IrsaService(cfg, http, cache)
             gaia = GaiaService(cfg, http)
             wise = WiseService(cfg, http)

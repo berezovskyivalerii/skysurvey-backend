@@ -263,6 +263,15 @@ class PipelineService:
         force_refresh: bool = False,
     ) -> dict[str, Any]:
         t0 = time.perf_counter()
+        prev_cached: dict[str, Any] | None = None
+        if force_refresh:
+            try:
+                existing = await self.db.get_target(ra, dec, fov, band)
+                if existing and existing.get("status") in ("ready", "partial", "no_data"):
+                    prev_cached = existing
+            except Exception:
+                pass
+
         base_row: dict[str, Any] = {
             "target_key": key,
             "ra": ra,
@@ -279,20 +288,23 @@ class PipelineService:
         }
         self.db.upsert_target_local(base_row)
 
+        gaia_task = asyncio.create_task(self._safe_gaia_query(ra, dec, fov), name=f"gaia:{key}")
+        wise_task = asyncio.create_task(self._safe_wise_query(ra, dec), name=f"wise:{key}")
+        skybot_task: asyncio.Task[Any] | None = None
+
         try:
-            # Step 3 & 4a in parallel: IRSA TAP/SIA + Gaia DR3 + CatWISE2020 (catalog errors isolated)
+            # Step 3: Start IRSA TAP/SIA immediately; Gaia & CatWISE run concurrently in background
+            # so slow catalog queries never delay Datalink resolution or FITS cutout downloads.
             try:
                 irsa_frames = self.irsa.query_frames(ra, dec, force_refresh=force_refresh)
             except TypeError:
                 # Backwards compatibility for test fakes with signature (ra, dec)
                 irsa_frames = self.irsa.query_frames(ra, dec)
 
-            frames, gaia_res, wise_res = await asyncio.gather(
-                irsa_frames,
-                self._safe_gaia_query(ra, dec, fov),
-                self._safe_wise_query(ra, dec),
-            )
+            frames = await irsa_frames
             if not frames:
+                gaia_res, wise_res = await asyncio.gather(gaia_task, wise_task)
+
                 def _build_no_data() -> dict[str, Any]:
                     grid = fp.make_grid(ra, dec, fov, self.s.spherex_pixel_scale_arcsec, self.s.png_size)
                     mjd_ref = 61000.0
@@ -323,6 +335,14 @@ class PipelineService:
                     display_by_epoch.append((ep, sel))
                     display_frames.extend(sel)
 
+            # Launch SkyBoT minor-planet ephemeris queries concurrently with FITS downloads
+            early_grid = fp.make_grid(ra, dec, fov, self.s.spherex_pixel_scale_arcsec, self.s.png_size)
+            early_mjds = [ep.mjd_mid for ep, _ in display_by_epoch]
+            skybot_task = asyncio.create_task(
+                self.solar_system.query_epochs(ra, dec, fov, early_mjds, early_grid.world_to_png),
+                name=f"skybot:{key}",
+            )
+
             self.db.upsert_target_local(
                 {
                     **base_row,
@@ -348,6 +368,9 @@ class PipelineService:
                 }
             )
 
+            # Collect Gaia & CatWISE results (already running since t=0) before CPU cross-match
+            gaia_res, wise_res = await asyncio.gather(gaia_task, wise_task)
+
             # CPU step in thread pool: load frames, WCS reproject, co-add, render PNGs, extract fast spectrum
             cpu_res = await asyncio.to_thread(
                 self._process_display_cpu,
@@ -363,12 +386,19 @@ class PipelineService:
             )
 
             # Save PNGs + co-add FITS locally to /tmp/fits_cache/storage (/static/storage/...)
-            # and query SkyBoT concurrently (Supabase upload is deferred to BackgroundTasks)
-            epoch_mjds = [ep_info["coadd"].mjd_mid for ep_info in cpu_res["epochs_info"]]
-            url_map, minor_planets_by_epoch = await asyncio.gather(
+            # and await SkyBoT (already running since before FITS downloads)
+            url_map, all_minor_planets = await asyncio.gather(
                 self.db.save_local_many(cpu_res["uploads"]),
-                self.solar_system.query_epochs(ra, dec, fov, epoch_mjds, cpu_res["grid"].world_to_png),
+                skybot_task,
             )
+            mp_by_index = {
+                ep.index: all_minor_planets[i]
+                for i, (ep, _) in enumerate(display_by_epoch)
+                if i < len(all_minor_planets)
+            }
+            minor_planets_by_epoch = [
+                mp_by_index.get(ep_info["coadd"].index, []) for ep_info in cpu_res["epochs_info"]
+            ]
 
             epochs_out: list[EpochOut] = []
             for idx_ep, ep_info in enumerate(cpu_res["epochs_info"]):
@@ -476,6 +506,9 @@ class PipelineService:
             return row
 
         except Exception as e:
+            if prev_cached is not None:
+                log.warning("Pipeline refresh failed for %s (%r); serving stale cached target row", key, e)
+                return self.db.upsert_target_local(prev_cached)
             log.exception("Pipeline failed for %s", key)
             failed_row = {
                 **base_row,
@@ -484,6 +517,10 @@ class PipelineService:
                 "error": str(e),
             }
             return self.db.upsert_target_local(failed_row)
+        finally:
+            for aux_task in (gaia_task, wise_task, skybot_task):
+                if aux_task is not None and not aux_task.done():
+                    aux_task.cancel()
 
     def _process_display_cpu(
         self,

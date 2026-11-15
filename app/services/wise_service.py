@@ -20,6 +20,7 @@ import httpx
 import numpy as np
 
 from app.config import Settings
+from app.core.async_utils import race_first_success
 from app.schemas.target import WiseSource
 from app.services.gaia_service import ang_sep_arcsec
 
@@ -158,12 +159,44 @@ class WiseService:
             FROM {self.s.wise_table}
             WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra:.8f}, {dec:.8f}, {radius:.6f})) = 1
         """
+        vizier_adql = f"""
+            SELECT objID AS source_id, RAdeg AS ra, DEdeg AS dec,
+                   pmRA AS pmra, pmDE AS pmdec,
+                   W1mproPM AS w1mpro, W2mproPM AS w2mpro,
+                   snrW1pm AS w1snr, snrW2pm AS w2snr
+            FROM "II/365/catwise"
+            WHERE CONTAINS(POINT('ICRS', RAdeg, DEdeg), CIRCLE('ICRS', {ra:.8f}, {dec:.8f}, {radius:.6f})) = 1
+        """
+        async def _hedged_vizier() -> list[dict[str, str]]:
+            await asyncio.sleep(0.15)
+            return await self._tap_csv(vizier_adql, tap_url="https://tapvizier.cds.unistra.fr/TAPVizieR/tap")
+
+        irsa_task = asyncio.create_task(self._tap_csv(catwise_adql), name="irsa-catwise")
+        vizier_task = asyncio.create_task(_hedged_vizier(), name="vizier-catwise")
         try:
-            raw_rows = await self._tap_csv(catwise_adql)
-            sources = self._parse_catwise_rows(raw_rows)
-            log.info("CatWISE2020 returned %d sources in %.2fs", len(sources), time.perf_counter() - t0)
-            return WiseResult(sources=sources, catalog="CatWISE2020", epoch_mjd=CATWISE_EPOCH_MJD)
+            done, pending = await asyncio.wait(
+                {irsa_task, vizier_task},
+                timeout=self.s.wise_timeout_s,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise TimeoutError(f"CatWISE query timed out after {self.s.wise_timeout_s}s")
+            first = next(iter(done))
+            if first.exception() is None:
+                for p in pending:
+                    p.cancel()
+                raw_rows = first.result()
+                sources = self._parse_catwise_rows(raw_rows)
+                log.info("CatWISE2020 (%s) returned %d sources in %.2fs", first.get_name(), len(sources), time.perf_counter() - t0)
+                return WiseResult(sources=sources, catalog="CatWISE2020", epoch_mjd=CATWISE_EPOCH_MJD)
+            # First task failed -> raise to trigger AllWISE fallback (and cancel pending hedged task if it hasn't started)
+            for p in pending:
+                p.cancel()
+            raise first.exception()  # type: ignore[misc]
         except asyncio.CancelledError:
+            for t in (irsa_task, vizier_task):
+                if not t.done():
+                    t.cancel()
             raise
         except Exception as exc:
             log.warning("CatWISE2020 query failed (%r); falling back to %s", exc, self.s.allwise_table)
@@ -181,14 +214,6 @@ class WiseService:
                 raise
             except Exception as exc2:
                 log.warning("AllWISE fallback failed (%r); trying VizieR CatWISE2020 mirror", exc2)
-                vizier_adql = f"""
-                    SELECT objID AS source_id, RAdeg AS ra, DEdeg AS dec,
-                           pmRA AS pmra, pmDE AS pmdec,
-                           W1mproPM AS w1mpro, W2mproPM AS w2mpro,
-                           snrW1pm AS w1snr, snrW2pm AS w2snr
-                    FROM "II/365/catwise"
-                    WHERE CONTAINS(POINT('ICRS', RAdeg, DEdeg), CIRCLE('ICRS', {ra:.8f}, {dec:.8f}, {radius:.6f})) = 1
-                """
                 try:
                     raw_rows = await self._tap_csv(
                         vizier_adql, tap_url="https://tapvizier.cds.unistra.fr/TAPVizieR/tap"

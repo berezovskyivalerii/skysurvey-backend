@@ -110,9 +110,11 @@ class IrsaService:
     async def _query_tap_csv(self, ra: float, dec: float) -> list[Frame]:
         """Fast async HTTP query to IRSA TAP/sync in CSV format (no ORDER BY!)."""
         adql = (
-            "SELECT obs_id, obs_collection, energy_bandpassname, t_min, t_max, s_ra, s_dec, access_url "
+            f"SELECT TOP {self.s.tap_max_rows} "
+            "obs_id, obs_collection, energy_bandpassname, t_min, t_max, s_ra, s_dec, access_url "
             f"FROM {self.s.spherex_obscore_table} "
-            f"WHERE CONTAINS(POINT('ICRS', {ra:.8f}, {dec:.8f}), s_region) = 1"
+            f"WHERE CONTAINS(POINT('ICRS', {ra:.8f}, {dec:.8f}), s_region) = 1 "
+            "AND obs_collection = 'spherex_dr1'"
         )
         url = f"{self.s.irsa_tap_url.rstrip('/')}/sync"
         r = await self.http.post(
@@ -145,6 +147,43 @@ class IrsaService:
 
     @staticmethod
     def _parse_sia_votable(content: bytes) -> list[Frame]:
+        # Fast C-expat XML parser for SIAv2 VOTable (avoids heavy astropy.io.votable CPU/GIL lock)
+        try:
+            import xml.etree.ElementTree as ET
+
+            root = ET.fromstring(content)
+            cols: list[str] = []
+            frames_fast: list[Frame] = []
+            for elem in root.iter():
+                tag = elem.tag.rsplit("}", 1)[-1]
+                if tag == "FIELD":
+                    col_name = (elem.attrib.get("name") or elem.attrib.get("ID") or "").strip()
+                    cols.append(col_name)
+                elif tag == "TR" and cols:
+                    vals = [(td.text or "").strip() for td in elem]
+                    if len(vals) < len(cols):
+                        continue
+                    row_map = dict(zip(cols, vals))
+                    det = detector_from_bandname(row_map.get("energy_bandpassname"))
+                    if det is None or not row_map.get("obs_id") or not row_map.get("access_url"):
+                        continue
+                    frames_fast.append(
+                        Frame(
+                            obs_id=row_map["obs_id"],
+                            detector=det,
+                            collection=row_map.get("obs_collection") or "spherex_dr1",
+                            t_min=float(row_map["t_min"]),
+                            t_max=float(row_map["t_max"]),
+                            access_url=row_map["access_url"],
+                            s_ra=float(row_map["s_ra"]) if row_map.get("s_ra") else None,
+                            s_dec=float(row_map["s_dec"]) if row_map.get("s_dec") else None,
+                        )
+                    )
+            if cols:
+                return frames_fast
+        except Exception:
+            pass
+
         from astropy.io import votable
 
         tab = votable.parse_single_table(io.BytesIO(content)).to_table(use_names_over_ids=True)
@@ -421,6 +460,32 @@ class IrsaService:
         paths = await asyncio.gather(*(self.fetch_cutout(f, ra, dec, size_deg) for f in frames))
         ok = [(f, p) for f, p in zip(frames, paths) if p is not None]
         log.info("Cutouts ready: %d/%d in %.2fs", len(ok), len(frames), time.perf_counter() - t0)
+        return ok
+
+    async def resolve_and_fetch_many(
+        self,
+        frames: list[Frame],
+        known: dict[str, str],
+        ra: float,
+        dec: float,
+        size_deg: float,
+    ) -> list[tuple[Frame, Path]]:
+        """Pipelined per-frame Datalink resolution + cutout streaming without a global barrier."""
+        t0 = time.perf_counter()
+        for f in frames:
+            f.fits_url = f.fits_url or known.get(f.key)
+
+        async def _one(f: Frame) -> tuple[Frame, Path | None]:
+            if not f.fits_url:
+                await self.resolve_one(f)
+            if not f.fits_url:
+                return f, None
+            p = await self.fetch_cutout(f, ra, dec, size_deg)
+            return f, p
+
+        results = await asyncio.gather(*(_one(f) for f in frames))
+        ok = [(f, p) for f, p in results if p is not None]
+        log.info("Pipelined Datalink + Cutouts ready: %d/%d in %.2fs", len(ok), len(frames), time.perf_counter() - t0)
         return ok
 
 

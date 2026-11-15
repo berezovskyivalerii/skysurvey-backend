@@ -457,6 +457,7 @@ def extract_spectrum(
     ra: float,
     dec: float,
     wavecal_dir: Path | None = None,
+    preloaded_samples: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Extract, aggregate, and analyze the 102-channel SPHEREx spectrum at `(ra, dec)`.
 
@@ -471,17 +472,36 @@ def extract_spectrum(
 
     raw_points: list[RawSpectralPoint] = []
     n_exposures_used = 0
-    for fpath in fits_files:
-        p = Path(fpath)
-        if not p.is_file():
-            continue
-        try:
-            pt = _photometer_single_fits(p, ra, dec, wavecal_dir)
-            if pt is not None:
-                raw_points.append(pt)
-                n_exposures_used += 1
-        except Exception as e:
-            log.debug("Skipping FITS file %s in extract_spectrum: %s", p.name, e)
+    if preloaded_samples is not None:
+        for s in preloaded_samples:
+            wl_um = float(s.wavelength_um)
+            ch0 = channel_index(wl_um)
+            if ch0 is None:
+                ch0 = 0 if wl_um < CHANNEL_CENTERS_UM[0] else N_CHANNELS - 1
+            raw_points.append(
+                RawSpectralPoint(
+                    channel_id=ch0 + 1,
+                    detector=int(s.detector),
+                    wavelength_um=wl_um,
+                    bandwidth_um=float(s.bandwidth_um),
+                    flux_ujy=float(s.flux_ujy),
+                    flux_error_ujy=float(s.error_ujy),
+                    is_flagged=False,
+                )
+            )
+            n_exposures_used += 1
+    else:
+        for fpath in fits_files:
+            p = Path(fpath)
+            if not p.is_file():
+                continue
+            try:
+                pt = _photometer_single_fits(p, ra, dec, wavecal_dir)
+                if pt is not None:
+                    raw_points.append(pt)
+                    n_exposures_used += 1
+            except Exception as e:
+                log.debug("Skipping FITS file %s in extract_spectrum: %s", p.name, e)
 
     # Group by channel_id (1..102)
     by_channel: dict[int, list[RawSpectralPoint]] = {}

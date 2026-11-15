@@ -326,11 +326,20 @@ class PipelineService:
                 return saved
 
             epochs = self.irsa.group_epochs(frames)
+            # On fast Cold Start, cap to at most 3 epochs x 1 best-centered frame (= 2-3 cutouts total)
+            # so NASA IRSA IBE never throttles or queues per-IP FITS slicing requests.
+            active_epochs = epochs[-3:] if (fast and len(epochs) > 3) else epochs
             detectors = BAND_GROUPS.get(band, BAND_GROUPS["all"])
             display_by_epoch: list[tuple[Epoch, list[Frame]]] = []
             display_frames: list[Frame] = []
-            for ep in epochs:
-                sel = self.irsa.select_display_frames(ep, detectors, ra, dec)
+            for ep in active_epochs:
+                sel = self.irsa.select_display_frames(
+                    ep,
+                    detectors,
+                    ra,
+                    dec,
+                    max_per_epoch=1 if fast else None,
+                )
                 if sel:
                     display_by_epoch.append((ep, sel))
                     display_frames.extend(sel)
@@ -351,13 +360,19 @@ class PipelineService:
                 }
             )
 
-            # Resolve Datalink URLs (using DB cache first)
+            # Resolve Datalink URLs & download cutouts (padded by 20% so rotated detector edges cover corners)
             known_urls = await self.db.get_cached_fits_urls([f.key for f in display_frames])
-            await self.irsa.resolve_fits_urls(display_frames, known_urls)
-
-            # Download cutouts (padded by 20% so rotated detector edges cover corners)
             cutout_deg = min(fov * 1.25, 0.5)
-            downloaded = await self.irsa.fetch_many(display_frames, ra, dec, cutout_deg)
+            if (
+                hasattr(self.irsa, "resolve_and_fetch_many")
+                and getattr(self.irsa.fetch_many, "__func__", None) is IrsaService.fetch_many
+            ):
+                downloaded = await self.irsa.resolve_and_fetch_many(
+                    display_frames, known_urls, ra, dec, cutout_deg
+                )
+            else:
+                await self.irsa.resolve_fits_urls(display_frames, known_urls)
+                downloaded = await self.irsa.fetch_many(display_frames, ra, dec, cutout_deg)
             path_by_key: dict[str, Path] = {f.key: p for f, p in downloaded}
 
             self.db.upsert_target_local(
@@ -659,18 +674,26 @@ class PipelineService:
         samples = [s for fd in all_loaded if (s := fp.extract_sample(fd, phot_ra, phot_dec)) is not None]
         points = fp.bin_spectrum(samples)
 
-        # Fast spectrum on Cold Start: compute only from already-downloaded cutouts;
+        # Fast spectrum on Cold Start: reuse already-loaded `samples` in memory without re-opening FITS files;
         # full directory scan / extra detector downloads are reserved for /target/spectrum or fast=False
-        fits_set = {p for p in path_by_key.values() if p is not None}
-        if not fast:
+        if fast:
+            spectrum_data = extract_spectrum(
+                [],
+                phot_ra,
+                phot_dec,
+                wavecal_dir=self.cache.root / "wavecal",
+                preloaded_samples=samples,
+            )
+        else:
+            fits_set = {p for p in path_by_key.values() if p is not None}
             for cov_p in find_covering_fits(self.cache.root / "raw", phot_ra, phot_dec):
                 fits_set.add(cov_p)
-        spectrum_data = extract_spectrum(
-            sorted(fits_set),
-            phot_ra,
-            phot_dec,
-            wavecal_dir=self.cache.root / "wavecal",
-        )
+            spectrum_data = extract_spectrum(
+                sorted(fits_set),
+                phot_ra,
+                phot_dec,
+                wavecal_dir=self.cache.root / "wavecal",
+            )
         # Preserve the requested query coordinates in the header block
         spectrum_data["target"] = {"ra": round(ra, 6), "dec": round(dec, 6)}
 

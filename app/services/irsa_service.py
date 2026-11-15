@@ -321,6 +321,14 @@ class IrsaService:
 
     @staticmethod
     def _parse_datalink_votable(content: bytes) -> str | None:
+        # Fast regex path for IRSA Datalink XML (<TD>https://...fits</TD>...<TD>#this</TD>)
+        for m in re.finditer(rb"<TR[^>]*>(.*?)</TR>", content, re.DOTALL | re.IGNORECASE):
+            tr = m.group(1)
+            if b"#this" in tr:
+                u = re.search(rb"<TD[^>]*>\s*(https?://[^<\s]+)\s*</TD>", tr, re.IGNORECASE)
+                if u:
+                    return u.group(1).decode("utf-8", errors="ignore").strip()
+
         from astropy.io import votable
 
         tab = votable.parse_single_table(io.BytesIO(content)).to_table(use_names_over_ids=True)

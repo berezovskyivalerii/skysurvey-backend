@@ -41,6 +41,7 @@ class SupabaseService:
         # In-memory fallback + L1 Datalink URL cache (persisted on disk across reloads)
         self._mem_targets: dict[str, dict[str, Any]] = {}
         self._obs_url_cache: dict[str, str] = {}
+        self._bg_sync_tasks: set[asyncio.Task[Any]] = set()
         self.local_storage_dir: Path = settings.cache_dir / "storage"
         self.local_storage_dir.mkdir(parents=True, exist_ok=True)
         self._local_db_file: Path = settings.cache_dir / "local_db.json"
@@ -314,13 +315,35 @@ class SupabaseService:
         uploads: list[tuple[str, bytes, str]],
         frames: list[Any] | None = None,
     ) -> None:
-        """Background task (`fastapi.BackgroundTasks`): upload PNGs/FITS to Supabase
-        Storage and upsert `observations` + `targets` into Supabase PostgreSQL."""
+        """Background task (`fastapi.BackgroundTasks`): detach cloud upload + DB upsert
+        into an independent asyncio task so Starlette/Uvicorn finishes the HTTP response
+        immediately without waiting for 20+ Supabase Storage uploads."""
+        if frames:
+            for f in frames:
+                if getattr(f, "fits_url", None):
+                    self._obs_url_cache[f.key] = f.fits_url
+            self._save_local_db()
+        if not self.enabled:
+            return
+        task = asyncio.create_task(
+            self._run_cloud_sync_bg(key, row, uploads, frames),
+            name=f"supabase-sync:{key}",
+        )
+        self._bg_sync_tasks.add(task)
+        task.add_done_callback(self._bg_sync_tasks.discard)
+
+    async def _run_cloud_sync_bg(
+        self,
+        key: str,
+        row: dict[str, Any],
+        uploads: list[tuple[str, bytes, str]],
+        frames: list[Any] | None = None,
+    ) -> None:
         try:
+            # Yield briefly so the HTTP response and /static/storage/ PNG requests flush first
+            await asyncio.sleep(0.25)
             if frames:
                 await self.save_observations(frames)
-            if not self.enabled:
-                return
             cloud_row = dict(row)
             if uploads:
                 await self.upload_many(uploads)

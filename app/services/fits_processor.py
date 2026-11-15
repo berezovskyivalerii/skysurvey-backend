@@ -69,11 +69,20 @@ class DisplayGrid:
     pixscale_deg: float
     png_size: int
     wcs: WCS = field(repr=False)
+    _sky_coords: tuple[np.ndarray, np.ndarray] | None = field(default=None, init=False, repr=False)
 
     def wcs_copy(self) -> WCS:
         """astropy WCS objects are not safe to share between threads (wcsset
         mutates internal state) - give each worker its own copy."""
         return copy.deepcopy(self.wcs)
+
+    def sky_coords(self) -> tuple[np.ndarray, np.ndarray]:
+        """Cached (ra_grid, dec_grid) arrays for fast vectorized WCS reprojection."""
+        if self._sky_coords is None:
+            yy, xx = np.mgrid[0 : self.n, 0 : self.n]
+            ra_g, dec_g = self.wcs_copy().pixel_to_world_values(xx, yy)
+            self._sky_coords = (np.asarray(ra_g, dtype=np.float64), np.asarray(dec_g, dtype=np.float64))
+        return self._sky_coords
 
     def world_to_png(self, ra: float, dec: float) -> tuple[float, float] | None:
         x, y = self.wcs_copy().world_to_pixel_values(ra, dec)
@@ -210,16 +219,37 @@ def _robust_background(img: np.ndarray) -> float:
 
 
 def reproject_frame(fd: FrameData, grid: DisplayGrid) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    from reproject import reproject_interp
+    from scipy.ndimage import map_coordinates
 
-    out_wcs = grid.wcs_copy()
-    shape = (grid.n, grid.n)
+    ra_g, dec_g = grid.sky_coords()
     img = fd.image - _robust_background(fd.image)  # equalise residual sky offsets between frames/detectors
-    stack = np.stack([img, fd.variance])  # one call, broadcast over the leading axis
-    (img_r, var_r), _ = reproject_interp((stack, fd.wcs), out_wcs, shape_out=shape, order="bilinear")
-    flg_r, fp = reproject_interp((fd.flags.astype(np.float64), fd.wcs), out_wcs, shape_out=shape, order="nearest-neighbor")
-    flg_r = np.where(np.isfinite(flg_r) & (fp > 0), flg_r, 0).astype(np.int64)
-    return img_r.astype(np.float32), var_r.astype(np.float32), flg_r
+    xp, yp = fd.wcs.world_to_pixel_values(ra_g, dec_g)
+    xp = np.asarray(xp, dtype=np.float64)
+    yp = np.asarray(yp, dtype=np.float64)
+    coords = np.array([yp, xp], dtype=np.float64)
+
+    ny, nx = fd.image.shape
+    in_bounds = (
+        np.isfinite(xp)
+        & np.isfinite(yp)
+        & (xp >= -0.5)
+        & (xp <= nx - 0.5)
+        & (yp >= -0.5)
+        & (yp <= ny - 0.5)
+    )
+    finite_mask = (np.isfinite(img) & np.isfinite(fd.variance)).astype(np.float32)
+    valid = map_coordinates(finite_mask, coords, order=1, mode="constant", cval=0.0) > 0.99
+    keep = in_bounds & valid
+
+    img_r = map_coordinates(np.nan_to_num(img, nan=0.0), coords, order=1, mode="constant", cval=0.0)
+    var_r = map_coordinates(np.nan_to_num(fd.variance, nan=0.0), coords, order=1, mode="constant", cval=0.0)
+    img_out = np.where(keep, img_r, np.nan).astype(np.float32)
+    var_out = np.where(keep, var_r, np.nan).astype(np.float32)
+
+    yi = np.clip(np.rint(yp).astype(np.intp), 0, ny - 1)
+    xi = np.clip(np.rint(xp).astype(np.intp), 0, nx - 1)
+    flg_out = np.where(in_bounds, fd.flags[yi, xi], 0).astype(np.int64)
+    return img_out, var_out, flg_out
 
 
 def coadd_epoch(index: int, frames: list[FrameData], grid: DisplayGrid) -> EpochCoadd:
